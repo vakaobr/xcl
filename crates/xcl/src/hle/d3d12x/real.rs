@@ -3970,6 +3970,15 @@ struct Dummy {
     cs: Vec<u8>,
 }
 
+/// The stand-in pixel shader. Nothing is drawn with it (its vertex / mesh shader makes no
+/// pixels), but its pipeline keeps the title's blend state, and that can be dual-source
+/// blending (SRC1 factors on target 0: a retail game's forward transparency passes). A host that
+/// builds the pixel stage for the blend state needs both colours then: Apple's Metal shader
+/// converter (D3DMetal) refuses a pixel shader that writes SV_Target0 alone ("Failed to compile
+/// fragment function", the pipeline a no-op). Hence SV_Target1 too; with the usual blending a
+/// second output changes nothing.
+const STANDIN_PS: &str = "struct O { float4 c0 : SV_Target0; float4 c1 : SV_Target1; };\nO main() { O o; o.c0 = float4(1, 0, 1, 1); o.c1 = float4(0, 0, 0, 0); return o; }\n";
+
 /// Stand-in mesh shader and pixel shader (DXIL, as mesh pipelines need): one degenerate
 /// triangle (DXC wants every output written), nothing drawn.
 fn dummy_mesh() -> Option<&'static (Vec<u8>, Vec<u8>)> {
@@ -3977,8 +3986,7 @@ fn dummy_mesh() -> Option<&'static (Vec<u8>, Vec<u8>)> {
     D.get_or_init(|| {
         use crate::gpu::recomp::dxc::compile;
         let ms = "struct V { float4 p : SV_Position; };\n[outputtopology(\"triangle\")]\n[numthreads(1, 1, 1)]\nvoid main(out vertices V v[1], out indices uint3 t[1]) { SetMeshOutputCounts(1, 1); v[0].p = float4(0, 0, 0, 1); t[0] = uint3(0, 0, 0); }\n";
-        let ps = "float4 main() : SV_Target { return float4(1, 0, 1, 1); }\n";
-        match (compile(ms, "main", "ms_6_5", &[]), compile(ps, "main", "ps_6_0", &[])) {
+        match (compile(ms, "main", "ms_6_5", &[]), compile(STANDIN_PS, "main", "ps_6_0", &[])) {
             (Ok(m), Ok(p)) => Some((m, p)),
             (m, p) => {
                 crate::xlog_warn!("D3D12.X: stand-in mesh shaders: {:?} {:?}", m.err(), p.err());
@@ -4016,10 +4024,23 @@ fn compile(src: &str, target: &str) -> Vec<u8> {
 /// Stand-in shaders used when the PC driver rejects a console shader.
 fn dummy() -> &'static Dummy {
     static D: OnceLock<Dummy> = OnceLock::new();
-    D.get_or_init(|| Dummy {
-        vs: compile("float4 main(uint id : SV_VertexID) : SV_Position { return float4(0, 0, 0, 1); }", "vs_5_0"),
-        ps: compile("float4 main() : SV_Target { return float4(1, 0, 1, 1); }", "ps_5_0"),
-        cs: compile("[numthreads(1, 1, 1)] void main() {}", "cs_5_0"),
+    D.get_or_init(|| {
+        // On a native host DXIL from DXC first: a host that turns DXIL into its own shaders
+        // (Apple's D3DMetal) has nothing for a DXBC stand-in; the old compiler is the fallback.
+        let native = native_host();
+        let both = |src: &str, new: &str, old: &str| match native.then(|| crate::gpu::recomp::dxc::compile(src, "main", new, &[])) {
+            Some(Ok(b)) if !b.is_empty() => b,
+            Some(r) => {
+                crate::xlog_warn!("D3D12.X: stand-in {new} shader not compiled by DXC ({:?}) – using {old}", r.err());
+                compile(src, old)
+            }
+            None => compile(src, old),
+        };
+        Dummy {
+            vs: both("float4 main(uint id : SV_VertexID) : SV_Position { return float4(0, 0, 0, 1); }", "vs_6_0", "vs_5_0"),
+            ps: both(STANDIN_PS, "ps_6_0", "ps_5_0"),
+            cs: both("[numthreads(1, 1, 1)] void main() {}", "cs_6_0", "cs_5_0"),
+        }
     })
 }
 
@@ -7973,6 +7994,25 @@ mod native_host_table_tests {
             assert_eq!(orig_table(pe_ext), ot as usize);
             assert_eq!(orig_fn(native_obj.as_mut_ptr() as *mut c_void, 1), host[NATIVE_HOST_PREFIX + 1]);
             assert_eq!(orig_fn(pe_obj.as_mut_ptr() as *mut c_void, 1), host[NATIVE_HOST_PREFIX + 1]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod standin_tests {
+    use super::*;
+
+    /// The stand-in pixel shaders write SV_Target0 and SV_Target1: the pair a pipeline with a
+    /// title's dual-source blend state needs (Metal's shader converter refuses SV_Target0 alone).
+    #[test]
+    fn standin_pixel_shaders_write_both_dual_source_colours() {
+        let targets = |b: &[u8]| -> Vec<u32> {
+            crate::gpu::dxbc::signatures(b).1.iter().filter(|e| e.name.eq_ignore_ascii_case("SV_Target")).map(|e| e.index).collect()
+        };
+        assert_eq!(targets(&dummy().ps), [0, 1], "the DXBC stand-in");
+        match dummy_mesh() {
+            Some((_, ps)) => assert_eq!(targets(ps), [0, 1], "the DXIL stand-in of mesh pipelines"),
+            None => crate::gpu::recomp::runner::skip_test("no DXC"),
         }
     }
 }
