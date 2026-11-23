@@ -72,8 +72,27 @@ unsafe fn allows(access: usize, at: usize) -> bool {
     }
 }
 
-/// `page` (reserved, 64 KiB aligned) is mapped: committed on first use.
+/// Whether pages are committed on first use: `XCL_LAZY_PAGES=1` / `0`, else everywhere but on a
+/// Mac (`util::mac_host`). Under Rosetta 2 the first access may be one that cannot be resumed
+/// after its fault (an AVX2 masked store: the process ends with "rosetta error: unexpectedly need
+/// to EmulateForward on a synchronous exception"), and each fault goes through Wine's exception
+/// dispatch. There a page is committed when it is mapped – which costs no memory on that host
+/// until the page is written (macOS does not charge commit).
+pub fn enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("XCL_LAZY_PAGES") {
+        Ok(v) => v.trim() != "0",
+        Err(_) => !crate::util::mac_host(),
+    })
+}
+
+/// `page` (reserved, 64 KiB aligned) is mapped: committed on first use (at once where that is
+/// off, `enabled`).
 pub(crate) fn mark(page: usize) {
+    if !enabled() {
+        unsafe { VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) };
+        return;
+    }
     install();
     LAZY.write().unwrap_or_else(|e| e.into_inner()).insert(page);
 }

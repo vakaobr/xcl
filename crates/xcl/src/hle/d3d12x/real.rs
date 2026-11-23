@@ -2062,6 +2062,13 @@ unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
     if let Some((p, _)) = console_buffer(this as usize) {
         return p as u64;
     }
+    // (a native host's answer for a texture is not known to be 0: the title's address first)
+    if native_host() {
+        let placed = super::title_textures::address(this as usize).or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied()));
+        if let Some(p) = placed {
+            return p as u64;
+        }
+    }
     let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, 11));
     // a texture has no GPU address on the PC (0) – on the console every resource has one, and
     // titles use a texture's as the CPU's pointer to it (a retail game clears a 256x256 R32F one
@@ -5454,7 +5461,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     // a rect list pipeline: the fourth corner of each rect comes from a generated GS; without
     // it each rect is drawn as the triangle of its three vertices
-    let rect_gs = if d.PrimitiveTopologyType.0 == RECT_LIST_TYPE && copy.GS.pShaderBytecode.is_null() {
+    let rect_gs = if d.PrimitiveTopologyType.0 == RECT_LIST_TYPE && copy.GS.pShaderBytecode.is_null() && rect_list_gs_allowed() {
         rect_list_gs(vs, shader_bytes(&d.PS)).map_err(|e| note_translation_error(format!("rect list drawn as triangles: {e}"))).ok()
     } else {
         None
@@ -6570,6 +6577,18 @@ unsafe fn untranslated_stream_desc(desc: *const c_void, stream: bool) -> Option<
     }
     pc_topology_type(&mut g);
     Some(g)
+}
+
+/// Whether rect list pipelines get the generated geometry shader: `XCL_RECT_LIST_GS=1` / `0`,
+/// else everywhere but on a native host (Apple's D3DMetal). Metal has no geometry stage – the
+/// host emulates one – and a pipeline it cannot make is not always an error code there. Without
+/// the GS a rect's fourth corner is made on the CPU (`bind::draw_rects`), which is what ran there.
+fn rect_list_gs_allowed() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("XCL_RECT_LIST_GS") {
+        Ok(v) => v.trim() != "0",
+        Err(_) => !native_host(),
+    })
 }
 
 /// The GS that completes a rect list's rects behind the console VS `vs` and the PS `ps`; refused

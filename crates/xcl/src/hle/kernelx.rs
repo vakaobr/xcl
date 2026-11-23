@@ -328,7 +328,8 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // the GPU reads where it is – one copy (a retail game's 4.4 GB; as plain memory its shaders
     // read zeros, in the sparse windows video memory would have doubled them). The window is as
     // large as what the title asked for last time (`uma::coherent_hint`).
-    if addr.is_null() && t & 0x1000 != 0 && p & PAGE_GRAPHICS_ANY != 0 && size <= crate::gpu::uma::MAX_SIZE && std::env::var("XCL_COHERENT_HEAPS").map_or(true, |v| v != "0") {
+    // Not on a Mac unless `XCL_COHERENT_HEAPS=1` (`coherent_heaps`).
+    if addr.is_null() && t & 0x1000 != 0 && p & PAGE_GRAPHICS_ANY != 0 && size <= crate::gpu::uma::MAX_SIZE && coherent_heaps() {
         static ASKED: AtomicUsize = AtomicUsize::new(0);
         let asked = ASKED.fetch_add(size, Ordering::Relaxed) + size;
         crate::gpu::uma::note_coherent_need(asked);
@@ -380,6 +381,23 @@ unsafe fn reserve_watched(size: usize, t: u32, p: u32) -> *mut c_void {
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
     }
     q
+}
+
+/// Whether the title's GPU heaps go to the coherent window: `XCL_COHERENT_HEAPS=1` / `0`, else
+/// everywhere but on a Mac (`util::mac_host`). There the window is not the GPU's memory (D3DMetal
+/// has no `OpenExistingHeapFromAddress`): it has a copy in video memory, kept in step through the
+/// window's write watch – which Wine keeps by protecting pages, and Rosetta cannot resume an AVX2
+/// masked store that faults (a retail game keeps its heaps in this memory: its first vectorised
+/// array fill, `vpmaskmovd [rax], ymm7, ymm6` at image +0x1d6f0a2, stopped the process 5 s into
+/// the run when that memory was in a sparse window – "rosetta error: unexpectedly need to
+/// EmulateForward on a synchronous exception"). The heaps are plain memory there, as they were:
+/// index and vertex buffers in them are mirrored (`list_x::gpu_va`), buffer views get an empty V#.
+fn coherent_heaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("XCL_COHERENT_HEAPS") {
+        Ok(v) => v.trim() != "0",
+        Err(_) => !crate::util::mac_host(),
+    })
 }
 
 /// PAGE_GRAPHICS_NOACCESS … PAGE_GRAPHICS_NOCACHE (0x800 – 0x40000): the console's protection of
