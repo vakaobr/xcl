@@ -3425,6 +3425,15 @@ fn note_fallback(what: &str, hr: HRESULT, ok: bool) {
     }
 }
 
+/// Whether a stage of the graphics description holds bytecode a PC driver cannot take.
+unsafe fn has_non_pc_stage(d: *const D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> bool {
+    if !crate::gpu::shader::readable(d as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+        return false;
+    }
+    let d = &*d;
+    [&d.VS, &d.PS, &d.DS, &d.HS, &d.GS].into_iter().any(|b| shader_bytes(b).is_some_and(|s| !crate::gpu::shader::runs_on_pc(s)))
+}
+
 type PsoFn = unsafe extern "system" fn(*mut c_void, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT;
 
 unsafe fn finish_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
@@ -4394,7 +4403,14 @@ unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID
         return hr;
     }
     let pc = untranslated_stream_desc(desc, stream);
-    let hr = finish_pso(this, f, pc.as_ref().map_or(desc, |g| g as *const _ as *const c_void), riid, ppv);
+    let graphics = if stream { pc.as_ref().map(|g| g as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC) } else { Some(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC) };
+    // a stage the PC cannot run goes straight to the fallback: Windows drivers refuse it, Apple's
+    // D3DMetal crashes on it
+    let hr = if graphics.is_some_and(|g| has_non_pc_stage(g)) {
+        E_INVALIDARG
+    } else {
+        finish_pso(this, f, pc.as_ref().map_or(desc, |g| g as *const _ as *const c_void), riid, ppv)
+    };
     if hr >= 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
         return hr;
     }
