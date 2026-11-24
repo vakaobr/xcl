@@ -48,6 +48,44 @@ fn mesh_ready() -> bool {
     }
 }
 
+/// Double-precision shader operations (`DoublePrecisionFloatShaderOps` of D3D12_OPTIONS) on the adapter `runner`
+/// uses. D3DMetal (macOS, CrossOver) reports none, and there a kernel with any f64 instruction writes nothing at all:
+/// its other results read 0 too (a `V_ADD_F64` next to a `V_CVT_F16_F32` zeroes both), while 64-bit integer operations
+/// run. So a test whose program has an f64 instruction skips on such a device. Windows GPUs and WARP report doubles.
+/// Without a GPU this answers true and `gpu_ready` / `gpu_waves` do the skipping.
+fn doubles_ready() -> bool {
+    static DOUBLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let doubles = *DOUBLES.get_or_init(|| device_doubles().unwrap_or(true));
+    if !doubles {
+        println!("no double-precision shader operations on this GPU – skipping");
+        runner::skip_test("no doubles");
+    }
+    doubles
+}
+
+/// `DoublePrecisionFloatShaderOps` of the adapter `XCL_ADAPTER` picks, chosen as `runner` chooses it.
+fn device_doubles() -> Result<bool, String> {
+    use crate::gpu::adapter::{candidates, Selector};
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::{D3D12_FEATURE_D3D12_OPTIONS, D3D12_FEATURE_DATA_D3D12_OPTIONS};
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory6, DXGI_CREATE_FACTORY_FLAGS};
+    let e = |x: windows::core::Error| x.to_string();
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(e)?;
+        let sel = Selector::from_env_or("auto");
+        let adapter: IDXGIAdapter1 = if sel == Selector::Warp {
+            factory.EnumWarpAdapter().map_err(e)?
+        } else {
+            candidates(&factory, &sel).into_iter().next().ok_or("no adapter")?.0
+        };
+        let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(e)?;
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as _, std::mem::size_of_val(&o) as u32)
+            .map_err(e)?;
+        Ok(o.DoublePrecisionFloatShaderOps.as_bool())
+    }
+}
+
 /// The wave sizes a per-lane test runs in, as the `wave64` option: true where the GPU has
 /// wave64, and false on every GPU, so the test also runs on NVIDIA. Empty without a GPU or DXC.
 fn gpu_waves() -> Vec<bool> {
@@ -486,7 +524,7 @@ fn f64_class_compare_vopc_and_vop3() {
 
 #[test]
 fn gpu_f64_class_compare() {
-    if !gpu_ready() {
+    if !gpu_ready() || !doubles_ready() {
         return;
     }
     let p = prog(&[
@@ -675,7 +713,7 @@ fn rndne_f64_instructions() {
 
 #[test]
 fn gpu_rndne_f64() {
-    if !gpu_ready() { return; }
+    if !gpu_ready() || !doubles_ready() { return; }
     let p = prog(&[("V_RNDNE_F64", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None)]);
     const INPUTS: [u64; 16] = [
         0.0f64.to_bits(), (-0.0f64).to_bits(), 0.5f64.to_bits(), (-0.5f64).to_bits(),
@@ -700,7 +738,7 @@ fn gpu_rndne_f64() {
 
 #[test]
 fn gpu_frexp_f64_exp_and_mant() {
-    if !gpu_ready() {
+    if !gpu_ready() || !doubles_ready() {
         return;
     }
     let p = prog(&[
@@ -803,6 +841,9 @@ fn pair(v: &[u32], i: usize) -> f64 {
 /// the CPU's IEEE results, bit for bit, including the sign of zero, |x| ≥ 2^63, ±inf and NaN.
 #[test]
 fn gpu_f64_rounding_and_conversions() {
+    if !doubles_ready() {
+        return;
+    }
     for wave64 in gpu_waves() {
         f64_rounding_and_conversions(wave64);
     }
@@ -858,6 +899,9 @@ fn f64_rounding_and_conversions(wave64: bool) {
 /// range get real roots within an ulp of the CPU's, a negative x gives NaN and −0 gives −0.
 #[test]
 fn gpu_f64_roots() {
+    if !doubles_ready() {
+        return;
+    }
     for wave64 in gpu_waves() {
         f64_roots(wave64);
     }
@@ -898,6 +942,9 @@ fn f64_roots(wave64: bool) {
 /// denormal results, exponents beyond the f32 range of 2^n.
 #[test]
 fn gpu_ldexp_f64() {
+    if !doubles_ready() {
+        return;
+    }
     for wave64 in gpu_waves() {
         ldexp_f64(wave64);
     }
@@ -1005,7 +1052,7 @@ fn gpu_valu_float_and_int() {
 /// unsigned adds, the packed 16-bit adds and the integer dot products.
 #[test]
 fn gpu_clamp_and_omod_per_instruction() {
-    if !gpu_ready() {
+    if !gpu_ready() || !doubles_ready() {
         return;
     }
     let p = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3P", f, None);
@@ -2654,7 +2701,7 @@ fn gpu_dword_addtid_per_lane_addresses() {
 
 #[test]
 fn gpu_valu_16_and_64_bit() {
-    if !gpu_ready() {
+    if !gpu_ready() || !doubles_ready() {
         return;
     }
     let p = prog(&[
@@ -4547,7 +4594,7 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
 /// Per-lane cells are deterministic; the three shared cells end in the unique winner's value.
 #[test]
 fn gpu_atomic_fcmpswap_x2() {
-    if !gpu_ready() {
+    if !gpu_ready() || !doubles_ready() {
         return;
     }
     let enc = |n: &'static str, e: &'static str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
@@ -4690,7 +4737,7 @@ fn gpu_atomic_fmin_fmax_negative_zero() {
 /// the f32 test. A seventh, per-lane cell checks the GLC return (global).
 #[test]
 fn gpu_atomic_fmin_fmax_x2() {
-    if !gpu_ready() {
+    if !gpu_ready() || !doubles_ready() {
         return;
     }
     let enc = |n: &'static str, e: &'static str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
@@ -6075,6 +6122,9 @@ fn gpu_fract_f32_edges() {
 /// when unordered, bit for bit against IEEE.
 #[test]
 fn gpu_f64_compares_with_nan() {
+    if !doubles_ready() {
+        return;
+    }
     for wave64 in gpu_waves() {
         f64_compares_with_nan(wave64);
     }
@@ -6227,6 +6277,9 @@ fn ldexp_ref(x: f64, n: i32) -> Option<f64> {
 /// one rounding. sqrt must be within 1 ulp and rsq within 2.
 #[test]
 fn gpu_f64_math_random() {
+    if !doubles_ready() {
+        return;
+    }
     for wave64 in gpu_waves() {
         f64_math_random(wave64);
     }
@@ -6335,7 +6388,11 @@ fn float_compares_random(wave64: bool) {
     };
     let mut rng = Rng(0x1234_5678_9ABC_DEF1);
     let mut total_bad = 0usize;
+    let doubles = doubles_ready();
     for ty in ["F32", "F64", "F16"] {
+        if ty == "F64" && !doubles {
+            continue;
+        }
         let (s0, s1) = if ty == "F64" { (V + 2, 4u64) } else { (V, 1u64) };
         let names: Vec<String> = OPS.iter().map(|o| format!("V_CMP_{o}_{ty}")).collect();
         let f3: Vec<[(&str, u64); 3]> = (0..16).map(|i| [("VDST", 20 + 2 * i as u64), ("SRC0", s0), ("SRC1", V + s1)]).collect();
@@ -6903,6 +6960,9 @@ fn gpu_ldexp_f32() {
 
 #[test]
 fn gpu_f64_literal_high_word() {
+    if !doubles_ready() {
+        return;
+    }
     for wave64 in gpu_waves() {
         let p = prog(&[
             // 1.0 + literal(1.5 = 0x3FF8_0000_0000_0000) == 2.5
