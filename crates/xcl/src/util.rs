@@ -132,6 +132,31 @@ pub fn under_wine() -> bool {
     })
 }
 
+/// The process runs under Wine on a Mac (ntdll's `wine_get_host_version` says Darwin): CrossOver
+/// or the Game Porting Toolkit, where D3D12 is Apple's D3DMetal and -- on Apple Silicon -- the
+/// title's code runs through Rosetta 2. Known from the start of the run, before there is a
+/// device (`gpu::shader::NATIVE_HOST_MEMORY` is set when the device is made). What differs
+/// there: a fault inside an AVX2 masked store cannot be resumed (so nothing the title writes
+/// may fault: write-watched or lazily committed memory), and every exception is slow.
+/// `XCL_MAC_HOST=1` / `0` overrides the detection.
+pub fn mac_host() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    static MAC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MAC.get_or_init(|| {
+        if let Ok(v) = std::env::var("XCL_MAC_HOST") {
+            return v.trim() != "0";
+        }
+        // SAFETY: ntdll is always loaded; Wine's export fills two pointers to static strings.
+        unsafe {
+            let Some(f) = GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_host_version".as_ptr() as *const u8) else { return false };
+            let f: unsafe extern "C" fn(*mut *const u8, *mut *const u8) = std::mem::transmute(f);
+            let (mut sysname, mut release) = (std::ptr::null(), std::ptr::null());
+            f(&mut sysname, &mut release);
+            from_cstr_ptr(sysname).is_some_and(|s| s.eq_ignore_ascii_case("Darwin"))
+        }
+    })
+}
+
 /// Normalised DLL key: lower-case file name, ".dll" appended when no extension.
 pub fn dll_key(name: &str) -> String {
     let base = name.rsplit(['\\', '/']).next().unwrap_or(name);
