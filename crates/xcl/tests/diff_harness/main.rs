@@ -174,6 +174,83 @@ fn test_mutation_catch() {
     minimise::print_minimised(&shrunk, &min_code);
 }
 
+/// Translate code and corrupt the HLSL: change the first V_ADD_NC_U32 lowering from
+/// addition to subtraction. The emitter writes `vD = select(act, vA + vB, vD);` for
+/// V_ADD_NC_U32 (see emit.rs line 3385). Returns the corrupted DXIL or Err if the
+/// program has no add or the corrupted HLSL fails to compile.
+fn translate_with_add_as_sub(code: &[u8]) -> Result<Vec<u8>, String> {
+    let opts = Options { wave64: true, split_wave64: true, ..Options::default() };
+    let t = translate(code, &opts)?;
+    if !t.complete() { return Err(format!("unsupported: {:?}", t.unsupported)); }
+    // Replace every V_ADD_NC_U32 lowering (" + v") with subtract (" - v") in the HLSL
+    // body. The emitter writes `select(act, vA + vB, vD)` for V_ADD_NC_U32. Early adds
+    // may operate on zero-valued VGPRs (the pool starts at 0); replacing all ensures that
+    // adds after non-zero values accumulate will produce different results.
+    let hlsl = &t.hlsl;
+    let body_start = hlsl.find("void main()").unwrap_or(0);
+    let (head, body) = hlsl.split_at(body_start);
+    let corrupted_body = body.replace(" + v", " - v");
+    if corrupted_body == body {
+        return Err("no V_ADD_NC_U32 pattern in HLSL".into());
+    }
+    let corrupted = format!("{head}{corrupted_body}");
+    dxc::compile(&corrupted, "main", "cs_6_6", &[])
+}
+
+/// Build a runnable triple with non-zero memory, so loads bring values into the VGPR pool
+/// and subsequent ALU operations produce non-trivial results.
+fn runnable_with_data(knobs: &gen::Knobs) -> (Vec<u8>, runner::KernelState, Vec<u32>) {
+    let (code, state, _) = runnable::runnable(knobs);
+    let mem: Vec<u32> = (0..512u32).map(|i| 0x1000 + i * 7).collect();
+    (code, state, mem)
+}
+
+/// Proves the harness catches a translation-level bug (not just a flipped bit in the
+/// result). The mutation changes every V_ADD_NC_U32 lowering from add to subtract in the
+/// HLSL. Memory is non-zero so loads bring values into the VGPR pool, and the adds that
+/// follow produce different results from subtracts. The minimiser shrinks the program to
+/// the smallest one that still contains the offending instruction.
+#[test]
+fn test_translation_mutation() {
+    if !gpu_and_dxc_ready() { return; }
+    // Find a seed whose program contains V_ADD_NC_U32 and where the mutation is visible
+    let mut found_seed = None;
+    for seed in 0..64u64 {
+        let knobs = default_knobs(seed);
+        let (code, state, mem) = runnable_with_data(&knobs);
+        let good = match compile_b(&code) { Ok(d) => d, Err(_) => continue };
+        let bad = match translate_with_add_as_sub(&code) { Ok(d) => d, Err(_) => continue };
+        let ra = match runner::run(&good, &state, &mem) { Ok(r) => r, Err(_) => continue };
+        let rb = match runner::run(&bad, &state, &mem) { Ok(r) => r, Err(_) => continue };
+        if !compare::compare(&ra, &rb).is_empty() {
+            found_seed = Some(seed);
+            break;
+        }
+    }
+    let seed = found_seed.expect("no seed showed a visible add-as-sub difference");
+    let knobs = default_knobs(seed);
+    let (code, state, mem) = runnable_with_data(&knobs);
+    let good = compile_b(&code).unwrap();
+    let bad = translate_with_add_as_sub(&code).unwrap();
+    let ra = runner::run(&good, &state, &mem).unwrap();
+    let rb = runner::run(&bad, &state, &mem).unwrap();
+    let diffs = compare::compare(&ra, &rb);
+    eprintln!("translation_mutation: seed {seed}, {} diffs:\n{}",
+        diffs.len(), compare::format_diffs(&diffs, 5));
+    // Minimise: find smallest program where add-as-sub still differs
+    let shrunk = minimise::minimise_ops(&knobs, &|k| {
+        let (c, s, m) = runnable_with_data(k);
+        let g = match compile_b(&c) { Ok(d) => d, Err(_) => return false };
+        let b = match translate_with_add_as_sub(&c) { Ok(d) => d, Err(_) => return false };
+        let ra = match runner::run(&g, &s, &m) { Ok(r) => r, Err(_) => return false };
+        let rb = match runner::run(&b, &s, &m) { Ok(r) => r, Err(_) => return false };
+        !compare::compare(&ra, &rb).is_empty()
+    });
+    eprintln!("translation_mutation minimised: {} -> {} ops", knobs.ops, shrunk.ops);
+    let (min_code, _, _) = runnable_with_data(&shrunk);
+    minimise::print_minimised(&shrunk, &min_code);
+}
+
 #[test]
 fn test_dxil_valid() {
     if !gpu_and_dxc_ready() { return; }
