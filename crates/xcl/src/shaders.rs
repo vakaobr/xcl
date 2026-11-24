@@ -1665,6 +1665,12 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     };
     let pipelines = pipelines.as_ref();
     let n = input.len().min(limit);
+    // `XCL_PRECOMPILE_SLICE=i/n` (experiment): this process takes only every n-th shader, from the
+    // i-th, so n processes share the work and each has its own driver compiler
+    let slice: Option<(usize, usize)> = std::env::var("XCL_PRECOMPILE_SLICE").ok().and_then(|v| {
+        let (i, n) = v.split_once('/')?;
+        Some((i.trim().parse().ok()?, n.trim().parse::<usize>().ok().filter(|n| *n > 0)?))
+    });
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -1696,6 +1702,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n {
                     break;
+                }
+                if slice.is_some_and(|(k, of)| i % of != k) {
+                    continue;
                 }
                 let record_done = || {
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
