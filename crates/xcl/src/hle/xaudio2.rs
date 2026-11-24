@@ -30,7 +30,7 @@
 
 #![allow(non_snake_case)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -677,6 +677,51 @@ static DECODED_VOICES: Mutex<Option<HashMap<usize, DecodedVoiceHandle>>> = Mutex
 /// Count of live decoded voices (fast path for plain PCM voices).
 static DECODED_LIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Under Wine: the contexts of the buffers submitted to each source voice XCL does not decode
+/// (plain PCM, or silence standing in for XMA / Opus), oldest first. Wine's XAudio2 counts the
+/// buffers of a voice that has not started but names no current one, where Windows names the
+/// first queued buffer; `get_state` then takes it from here. Decoded voices have their own
+/// record (`DecodedVoiceState::live_buffers`). Not kept on Windows: the host answers there.
+static QUEUED: Mutex<Option<HashMap<usize, VecDeque<usize>>>> = Mutex::new(None);
+
+/// XAUDIO2_MAX_QUEUED_BUFFERS: a voice holds no more, so no more contexts are kept
+const MAX_QUEUED_BUFFERS: usize = 64;
+/// XAUDIO2_VOICE_NOSAMPLESPLAYED: GetState without the samples played (cheaper)
+const VOICE_NOSAMPLESPLAYED: u32 = 0x100;
+
+/// A buffer with `context` went to the voice.
+fn note_submitted(q: &mut VecDeque<usize>, context: usize) {
+    if q.len() == MAX_QUEUED_BUFFERS {
+        q.pop_front();
+    }
+    q.push_back(context);
+}
+
+/// The context of the oldest of the `queued` buffers the host still holds (it plays them in
+/// the order they came, so they are the last `queued` submitted).
+fn oldest_queued(q: &VecDeque<usize>, queued: usize) -> Option<usize> {
+    let n = queued.min(q.len());
+    (n > 0).then(|| q[q.len() - n])
+}
+
+/// FlushSourceBuffers took the voice from `before` queued buffers to `after`: it drops all but
+/// the one that is playing, the oldest.
+fn note_flushed(q: &mut VecDeque<usize>, before: usize, after: usize) {
+    let n = before.min(q.len());
+    let kept: Vec<usize> = q.iter().skip(q.len() - n).take(after.min(n)).copied().collect();
+    q.clear();
+    q.extend(kept);
+}
+
+/// The buffers the host has queued on a source voice.
+unsafe fn host_queued(this: *mut c_void) -> usize {
+    let Some(orig) = original(this, VOICE_GET_STATE) else { return 0 };
+    let orig: GetStateFn = std::mem::transmute(orig);
+    let mut st = XAudio2VoiceState { current_buffer_context: std::ptr::null_mut(), buffers_queued: 0, samples_played: 0 };
+    orig(this, &mut st, VOICE_NOSAMPLESPLAYED);
+    st.buffers_queued as usize
+}
+
 unsafe fn vtable(obj: *mut c_void) -> *mut usize {
     *(obj as *const *mut usize)
 }
@@ -1109,7 +1154,7 @@ unsafe extern "system" fn submit_source_buffer(this: *mut c_void, buf: *const XA
         }
     }
     let info = XMA.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied());
-    match info {
+    let hr = match info {
         Some(i) if !buf.is_null() => {
             let s = silence();
             if s.is_null() {
@@ -1120,13 +1165,27 @@ unsafe extern "system" fn submit_source_buffer(this: *mut c_void, buf: *const XA
             orig(this, &nb, std::ptr::null())
         }
         _ => orig(this, buf, wma),
+    };
+    // (the title's own context goes to the host on both paths)
+    if hr >= 0 && !buf.is_null() && crate::util::under_wine() {
+        let context = buf.read_unaligned().context as usize;
+        note_submitted(QUEUED.lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default(), context);
     }
+    hr
 }
 
 unsafe extern "system" fn flush_source_buffers(this: *mut c_void) -> HRESULT {
     let Some(orig) = original(this, VOICE_FLUSH_SOURCE_BUFFERS) else { return E_FAIL };
     let orig: FlushSourceBuffersFn = std::mem::transmute(orig);
+    let tracked = crate::util::under_wine() && QUEUED.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&(this as usize)));
+    let before = if tracked { host_queued(this) } else { 0 };
     let hr = orig(this);
+    if hr >= 0 && tracked {
+        let after = host_queued(this);
+        if let Some(q) = QUEUED.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+            note_flushed(q, before, after);
+        }
+    }
     if hr >= 0 && DECODED_LIVE_COUNT.load(Ordering::Acquire) != 0 {
         let state = DECODED_VOICES
             .lock()
@@ -1144,7 +1203,10 @@ unsafe extern "system" fn get_state(this: *mut c_void, state_out: *mut XAudio2Vo
     let Some(orig) = original(this, VOICE_GET_STATE) else { return };
     let orig: GetStateFn = std::mem::transmute(orig);
     orig(this, state_out, flags);
-    if !state_out.is_null() && DECODED_LIVE_COUNT.load(Ordering::Acquire) != 0 {
+    if state_out.is_null() {
+        return;
+    }
+    if DECODED_LIVE_COUNT.load(Ordering::Acquire) != 0 {
         let voice_state = DECODED_VOICES
             .lock()
             .unwrap()
@@ -1166,6 +1228,16 @@ unsafe extern "system" fn get_state(this: *mut c_void, state_out: *mut XAudio2Vo
                     (*state_out).current_buffer_context = buf.orig_context as *mut c_void;
                 }
             }
+            return;
+        }
+    }
+    // a voice XCL does not decode, under Wine: the same gap, answered from `QUEUED` (a title's
+    // own null context reads as null either way)
+    let queued = (*state_out).buffers_queued as usize;
+    if (*state_out).current_buffer_context.is_null() && queued != 0 && crate::util::under_wine() {
+        let oldest = QUEUED.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|q| oldest_queued(q, queued));
+        if let Some(context) = oldest {
+            (*state_out).current_buffer_context = context as *mut c_void;
         }
     }
 }
@@ -1174,6 +1246,9 @@ unsafe extern "system" fn destroy_voice(this: *mut c_void) {
     let Some(orig) = original(this, VOICE_DESTROY) else { return };
     let orig: DestroyVoiceFn = std::mem::transmute(orig);
     if let Some(m) = XMA.lock().unwrap().as_mut() {
+        m.remove(&(this as usize));
+    }
+    if let Some(m) = QUEUED.lock().unwrap().as_mut() {
         m.remove(&(this as usize));
     }
     let decoded_handle = if DECODED_LIVE_COUNT.load(Ordering::Acquire) != 0 {
@@ -1715,6 +1790,121 @@ mod tests {
         // Truncated looping buffer with non-zero max_bytes loops the full silence buffer cleanly.
         let b = silent_buffer(&i, &buffer(0x1000, 1000, 1_000_000, 1000, 500_000, 255), z, 4000);
         assert_eq!(({ b.audio_bytes }, { b.play_begin }, { b.play_length }, { b.loop_begin }, { b.loop_length }, { b.loop_count }), (4000, 0, 0, 0, 0, 255));
+    }
+
+    /// The record `get_state` answers from under Wine: the host's queued buffers are the last
+    /// ones submitted, a flush keeps the playing one, and no more than a voice can hold are kept.
+    #[test]
+    fn queued_contexts_follow_submits_and_flushes() {
+        let mut q = VecDeque::new();
+        assert_eq!(oldest_queued(&q, 2), None);
+        for c in [0x11usize, 0x22, 0x33] {
+            note_submitted(&mut q, c);
+        }
+        assert_eq!((oldest_queued(&q, 3), oldest_queued(&q, 2), oldest_queued(&q, 1), oldest_queued(&q, 0)), (Some(0x11), Some(0x22), Some(0x33), None));
+        // more queued than was seen (a voice submitted to before the record began): the oldest known
+        assert_eq!(oldest_queued(&q, 9), Some(0x11));
+        // a flush of a voice that plays 0x22 (0x11 has ended): 0x22 stays, 0x33 goes
+        note_flushed(&mut q, 2, 1);
+        assert_eq!(q, [0x22]);
+        note_submitted(&mut q, 0x44);
+        assert_eq!(oldest_queued(&q, 2), Some(0x22));
+        // a flush of a voice that has not started: nothing stays
+        note_flushed(&mut q, 2, 0);
+        assert!(q.is_empty());
+        // a flush the host has not carried out yet leaves the record; what is submitted after it
+        // is still found, as the last queued
+        for c in [0x55usize, 0x66] {
+            note_submitted(&mut q, c);
+        }
+        note_flushed(&mut q, 2, 2);
+        note_submitted(&mut q, 0x77);
+        assert_eq!(oldest_queued(&q, 1), Some(0x77));
+        // a title's own null context is a context like any other
+        note_submitted(&mut q, 0);
+        assert_eq!(oldest_queued(&q, 1), Some(0));
+        for c in 0..2 * MAX_QUEUED_BUFFERS {
+            note_submitted(&mut q, 0x1000 + c);
+        }
+        assert_eq!((q.len(), oldest_queued(&q, MAX_QUEUED_BUFFERS)), (MAX_QUEUED_BUFFERS, Some(0x1000 + MAX_QUEUED_BUFFERS)));
+    }
+
+    /// GetState of a plain PCM voice with buffers queued and not started names the first one,
+    /// and after those have played, the next one submitted. Windows' XAudio2 says so itself;
+    /// Wine's names no buffer before it starts (`QUEUED`).
+    #[test]
+    fn get_state_names_the_oldest_buffer_of_a_voice_that_is_not_decoded() {
+        struct AudioGuard {
+            eng: *mut c_void,
+            master: *mut c_void,
+            voice: *mut c_void,
+        }
+        impl Drop for AudioGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    for v in [self.voice, self.master] {
+                        if !v.is_null() {
+                            let destroy: DestroyVoiceFn = std::mem::transmute(vtable(v).add(VOICE_DESTROY).read());
+                            destroy(v);
+                        }
+                    }
+                    if !self.eng.is_null() {
+                        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vtable(self.eng).add(2).read());
+                        release(self.eng);
+                    }
+                }
+            }
+        }
+        // (declared before the guard: the voice goes before the memory it plays)
+        let pcm = vec![0u8; 480 * 4]; // 10 ms
+        unsafe {
+            let mut guard = AudioGuard { eng: std::ptr::null_mut(), master: std::ptr::null_mut(), voice: std::ptr::null_mut() };
+            assert_eq!(XAudio2Create(&mut guard.eng, 0, 1), S_OK);
+            let vt_eng = vtable(guard.eng);
+            let create_master: CreateMasteringVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_MASTERING_VOICE).read());
+            if create_master(guard.eng, &mut guard.master, 0, 0, 0, std::ptr::null(), std::ptr::null(), AUDIO_CATEGORY_GAME_EFFECTS) < 0 {
+                eprintln!("skipping: no audio device");
+                return;
+            }
+            let create_src: CreateSourceVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_SOURCE_VOICE).read());
+            let wfx = pcm16_for_rate(2, 48_000);
+            assert_eq!(create_src(guard.eng, &mut guard.voice, &wfx, 0, 2.0, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()), S_OK);
+            let vt_v = vtable(guard.voice);
+            let submit: SubmitSourceBufferFn = std::mem::transmute(vt_v.add(VOICE_SUBMIT_SOURCE_BUFFER).read());
+            let get_st: GetStateFn = std::mem::transmute(vt_v.add(VOICE_GET_STATE).read());
+            let start: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = std::mem::transmute(vt_v.add(19).read());
+            let state = || {
+                let mut st = XAudio2VoiceState { current_buffer_context: std::ptr::null_mut(), buffers_queued: 0, samples_played: 0 };
+                get_st(guard.voice, &mut st, 0);
+                ({ st.buffers_queued }, { st.current_buffer_context } as usize)
+            };
+            let buffer = |context: usize| XAudio2Buffer {
+                flags: 0,
+                audio_bytes: pcm.len() as u32,
+                audio_data: pcm.as_ptr(),
+                play_begin: 0,
+                play_length: 0,
+                loop_begin: 0,
+                loop_length: 0,
+                loop_count: 0,
+                context: context as *mut c_void,
+            };
+            assert_eq!(state(), (0, 0));
+            assert_eq!(submit(guard.voice, &buffer(0x5001), std::ptr::null()), S_OK);
+            assert_eq!(submit(guard.voice, &buffer(0x5002), std::ptr::null()), S_OK);
+            assert_eq!(state(), (2, 0x5001), "two queued, not started");
+            // both play (20 ms), then one more is the only one queued
+            assert_eq!(start(guard.voice, 0, 0), S_OK);
+            let t0 = std::time::Instant::now();
+            while state().0 != 0 {
+                assert!(t0.elapsed() < std::time::Duration::from_secs(5), "the two buffers never ended: {:x?}", state());
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let stop: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = std::mem::transmute(vt_v.add(20).read());
+            assert_eq!(stop(guard.voice, 0, 0), S_OK);
+            assert_eq!(submit(guard.voice, &buffer(0x5003), std::ptr::null()), S_OK);
+            assert_eq!(state(), (1, 0x5003), "one queued after the first two have played");
+        }
     }
 
     #[test]
