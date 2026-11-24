@@ -87,9 +87,13 @@ struct WndClassW {
 #[link(name = "user32", kind = "raw-dylib")]
 extern "system" {
     fn RegisterClassW(c: *const WndClassW) -> u16;
+    fn UnregisterClassW(class: *const u16, instance: usize) -> i32;
     fn DestroyWindow(h: *mut c_void) -> i32;
     fn GetWindowLongW(h: *mut c_void, index: i32) -> i32;
     fn GetClientRect(h: *mut c_void, r: *mut [i32; 4]) -> i32;
+    fn IsWindowVisible(h: *mut c_void) -> i32;
+    fn ShowWindow(h: *mut c_void, cmd: i32) -> i32;
+    fn SetWindowPos(h: *mut c_void, after: *mut c_void, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
     fn DefWindowProcW(h: *mut c_void, m: u32, w: usize, l: isize) -> isize;
 }
 
@@ -369,27 +373,48 @@ fn main() {
             let h = LoadLibraryW(wide(dll).as_ptr());
             if h == 0 { 0 } else { GetProcAddress(h, name.as_ptr()) }
         };
-        let (fw, fa) = (lookup("ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", b"CreateWindowExW "), lookup("ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll", b"CreateWindowExA "));
-        ensure!(fw != 0 && fa != 0, "CreateWindowExW {fw:#x} / A {fa:#x} from the ntuser API sets");
-        let (cw, ca): (CreateWindowExFn<u16>, CreateWindowExFn<u8>) = (std::mem::transmute(fw), std::mem::transmute(fa));
-        let w = cw(0x4_0000, class.as_ptr(), title.as_ptr(), style, 100, 100, 1280, 720, std::ptr::null_mut(), std::ptr::null_mut(), wc.instance, std::ptr::null());
-        let a = ca(0, b"XclTestTitleWindow ".as_ptr(), b"test title ".as_ptr(), style, 100, 100, 1280, 720, std::ptr::null_mut(), std::ptr::null_mut(), wc.instance, std::ptr::null());
-        ensure!(!w.is_null() && !a.is_null(), "CreateWindowExW {w:?} / A {a:?}");
-        for (name, h) in [("W", w), ("A", a)] {
-            let ex = GetWindowLongW(h, -20) as u32;
-            let st = GetWindowLongW(h, -16) as u32;
-            let mut r = [0i32; 4];
-            GetClientRect(h, &mut r);
+        // cloaked, or not visible: where DWM cannot cloak (Wine) XCL hides the window instead (#794)
+        let concealed = |h: *mut c_void| {
             let mut cloaked = 0u32;
-            DwmGetWindowAttribute(h, 14, &mut cloaked as *mut u32 as *mut c_void, 4);
-            ensure!(ex & 0x80 != 0 && ex & 0x4_0000 == 0, "{name}: not a tool window (no taskbar button) – exstyle {ex:#x}");
-            ensure!(st & 0x8000_0000 != 0 && st & 0x00C0_0000 == 0, "{name}: not a frameless popup – style {st:#x}");
-            ensure!(r[2] - r[0] == 1920 && r[3] - r[1] == 1080, "{name}: client area {}x{}", r[2] - r[0], r[3] - r[1]);
-            ensure!(cloaked != 0, "{name}: not cloaked");
+            let hr = DwmGetWindowAttribute(h, 14, &mut cloaked as *mut u32 as *mut c_void, 4);
+            ((hr >= 0 && cloaked != 0) || IsWindowVisible(h) == 0, hr, cloaked)
+        };
+        let mut made: Vec<*mut c_void> = Vec::new();
+        let checked = (|| {
+            let (fw, fa) = (lookup("ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", b"CreateWindowExW "), lookup("ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll", b"CreateWindowExA "));
+            ensure!(fw != 0 && fa != 0, "CreateWindowExW {fw:#x} / A {fa:#x} from the ntuser API sets");
+            let (cw, ca): (CreateWindowExFn<u16>, CreateWindowExFn<u8>) = (std::mem::transmute(fw), std::mem::transmute(fa));
+            let w = cw(0x4_0000, class.as_ptr(), title.as_ptr(), style, 100, 100, 1280, 720, std::ptr::null_mut(), std::ptr::null_mut(), wc.instance, std::ptr::null());
+            let a = ca(0, b"XclTestTitleWindow ".as_ptr(), b"test title ".as_ptr(), style, 100, 100, 1280, 720, std::ptr::null_mut(), std::ptr::null_mut(), wc.instance, std::ptr::null());
+            made.extend([w, a].into_iter().filter(|h| !h.is_null()));
+            ensure!(!w.is_null() && !a.is_null(), "CreateWindowExW {w:?} / A {a:?}");
+            for (name, h) in [("W", w), ("A", a)] {
+                let ex = GetWindowLongW(h, -20) as u32;
+                let st = GetWindowLongW(h, -16) as u32;
+                let mut r = [0i32; 4];
+                GetClientRect(h, &mut r);
+                ensure!(ex & 0x80 != 0 && ex & 0x4_0000 == 0, "{name}: not a tool window (no taskbar button) – exstyle {ex:#x}");
+                ensure!(st & 0x8000_0000 != 0 && st & 0x00C0_0000 == 0, "{name}: not a frameless popup – style {st:#x}");
+                ensure!(r[2] - r[0] == 1920 && r[3] - r[1] == 1080, "{name}: client area {}x{}", r[2] - r[0], r[3] - r[1]);
+                let (ok, hr, cloaked) = concealed(h);
+                ensure!(ok, "{name}: neither cloaked nor hidden (DwmGetWindowAttribute {hr:#x}, cloaked {cloaked})");
+                // a title showing it again, as titles do (SW_SHOW), then SWP_SHOWWINDOW | SWP_NOACTIVATE
+                ShowWindow(h, 5);
+                ensure!(SetWindowPos(h, std::ptr::null_mut(), 0, 0, 0, 0, 0x1 | 0x2 | 0x4 | 0x10 | 0x40) != 0, "{name}: SetWindowPos failed");
+                let (ok, hr, cloaked) = concealed(h);
+                ensure!(ok, "{name}: shown after ShowWindow / SetWindowPos(SWP_SHOWWINDOW) (DwmGetWindowAttribute {hr:#x}, cloaked {cloaked})");
+            }
+            Ok(())
+        })();
+        let destroyed = made.iter().fold(true, |ok, &h| DestroyWindow(h) != 0 && ok);
+        let unregistered = UnregisterClassW(class.as_ptr(), wc.instance) != 0;
+        let cleanup = format!("cleanup: DestroyWindow {destroyed}, UnregisterClassW {unregistered}");
+        match checked {
+            Ok(()) if destroyed && unregistered => Ok(()),
+            Ok(()) => Err(cleanup),
+            Err(e) if destroyed && unregistered => Err(e),
+            Err(e) => Err(format!("{e}; {cleanup}")),
         }
-        DestroyWindow(w);
-        DestroyWindow(a);
-        Ok(())
     });
 
     check("GameInput: GameInputCreate reaches the system GameInput (timestamps advance)", || unsafe {
