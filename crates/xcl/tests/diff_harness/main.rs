@@ -328,3 +328,71 @@ fn explain_seed() {
     let d = compare::compare(&runner::run(&x, &state, &mem).unwrap(), &runner::run(&y, &state, &mem).unwrap());
     eprintln!("minimised: {} diffs\n{}", d.len(), compare::format_diffs(&d, 12));
 }
+
+/// Path C: #1745's per-lane form of the direct backend, in its split form (two hardware
+/// wave32s per console wave64), as `lower_dxil`'s own GPU test runs it. Also returns the mask
+/// registers whose final value may differ from the console's (`lower::lower_kernel`'s stale
+/// list): nothing in the program reads them, only the kernel ABI's store of every register.
+fn compile_c(code: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut insts = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let d = xcl::gpu::rdna2::decode(&code[off..], off as u64).map_err(|e| format!("unsupported: cannot decode ({e:?})"))?;
+        off += d.len;
+        insts.push(d);
+    }
+    xcl::gpu::rdna2::resolve_far_jumps(&mut insts);
+    let (dxil, stale) = xcl::gpu::recomp::lower_dxil::kernel_split(&insts).map_err(|e| format!("refused: {e}"))?;
+    validate_dxil(&dxil)?;
+    validate::validate(&dxil).map_err(|e| format!("IDxcValidator (path C / per-lane): {e}"))?;
+    Ok((dxil, stale))
+}
+
+/// One program through the HLSL path (A) and the per-lane form (C), each run twice. Ok(true)
+/// when they match on everything but C's stale masks and the program changed something.
+fn run_one_per_lane(seed: u64) -> Result<bool, String> {
+    let (code, state, mem) = runnable_with_data(&default_knobs(seed));
+    let dxil_a = compile_a(&code)?;
+    let (dxil_c, stale) = compile_c(&code)?;
+    let ra = runner::run(&dxil_a, &state, &mem)?;
+    let rc = runner::run(&dxil_c, &state, &mem)?;
+    for (name, dxil, first) in [("A", &dxil_a, &ra), ("C", &dxil_c, &rc)] {
+        let again = compare::compare(first, &runner::run(dxil, &state, &mem)?);
+        if !again.is_empty() {
+            return Err(format!("unstable {name}: seed {seed}: {} diffs between two runs:\n{}", again.len(), compare::format_diffs(&again, 10)));
+        }
+    }
+    let diffs: Vec<_> = compare::compare(&ra, &rc).into_iter().filter(|d| !(d.reg == "sgpr" && stale.contains(&(d.index as u8)))).collect();
+    if !diffs.is_empty() {
+        return Err(format!("seed {seed}: {} diffs (stale masks {stale:?} left out):\n{}", diffs.len(), compare::format_diffs(&diffs, 10)));
+    }
+    let mem_changed = ra.mem.iter().zip(&mem).any(|(a, b)| a != b);
+    let vgpr_changed = ra.vgpr.iter().zip(&state.vgpr).any(|(got, init)| got.iter().zip(init.iter()).any(|(a, b)| a != b));
+    Ok(mem_changed || vgpr_changed)
+}
+
+/// 1000 race-free programs through the HLSL path and #1745's per-lane form. Refusals are
+/// counted (the per-lane form refuses what it cannot prove), not failures.
+#[test]
+#[ignore]
+fn test_long_sweep_per_lane() {
+    if !gpu_and_dxc_ready() { return; }
+    let (mut tested, mut nontrivial, mut refused, mut failures, mut unstable_a, mut unstable_c) = (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+    let mut reasons: std::collections::BTreeMap<String, u32> = Default::default();
+    for seed in 0..1000u64 {
+        match run_one_per_lane(seed) {
+            Ok(changed) => { tested += 1; nontrivial += changed as u32; }
+            Err(e) if e.starts_with("refused") || e.starts_with("unsupported") => {
+                refused += 1;
+                *reasons.entry(e.lines().next().unwrap_or("").chars().take(120).collect()).or_default() += 1;
+            }
+            Err(e) if e.starts_with("unstable A") => { eprintln!("{e}"); unstable_a += 1; }
+            Err(e) if e.starts_with("unstable C") => { eprintln!("{e}"); unstable_c += 1; }
+            Err(e) => { eprintln!("{e}"); failures += 1; }
+        }
+    }
+    for (r, n) in &reasons { eprintln!("refused x{n}: {r}"); }
+    eprintln!("per_lane_sweep: {tested} tested, {nontrivial} changed memory or registers, {refused} refused, {failures} differences, {unstable_a} unstable on A, {unstable_c} unstable on C");
+    assert_eq!(failures, 0);
+    assert_eq!(unstable_c, 0);
+}
