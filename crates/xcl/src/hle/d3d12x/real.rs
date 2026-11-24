@@ -1546,7 +1546,23 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
 
 unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    // The last reference: kept until the queues are past the work in flight (`late_release`).
+    // (Two last-but-one releases at once can miss each other here; the object then goes at
+    // once, as before.)
+    let mut held = false;
+    let n = if super::late_release::enabled() {
+        let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+        if add(this) == 2 {
+            f(this);
+            held = true;
+            0
+        } else {
+            f(this);
+            f(this)
+        }
+    } else {
+        f(this)
+    };
     if n == 0 {
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
@@ -1571,6 +1587,9 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
                 u.free(p);
             }
         }
+    }
+    if held {
+        super::late_release::hold(this as usize);
     }
     n
 }
@@ -2650,6 +2669,34 @@ creator!(dev_create_command_queue1, "CreateCommandQueue1", Kind::CommandQueue, [
 creator!(dev_create_command_allocator, "CreateCommandAllocator", Kind::CommandAllocator, [a1]);
 creator!(dev_create_command_list, "CreateCommandList", Kind::CommandList, [a1, a2, a3, a4]);
 creator!(dev_create_command_list1, "CreateCommandList1", Kind::CommandList, [a1, a2, a3]);
+
+/// Create a raw adopted PC `ID3D12GraphicsCommandList` without wrapping it in `title_list`
+/// (used for deferred mid-list split segments on the same allocator).
+pub(super) unsafe fn create_raw_pc_command_list(
+    dev: *mut c_void,
+    ty: D3D12_COMMAND_LIST_TYPE,
+    alloc: usize,
+    init_pso: usize,
+) -> Option<*mut c_void> {
+    if dev.is_null() || alloc == 0 {
+        return None;
+    }
+    let iid = layout::parse_guid(layout::find("ID3D12GraphicsCommandList")?.iid);
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let hr = if is_ext(vt(dev) as usize) {
+        dev_create_command_list(dev, 0, ty.0 as usize, alloc, init_pso, &iid, &mut out)
+    } else {
+        type F = unsafe extern "system" fn(*mut c_void, u32, D3D12_COMMAND_LIST_TYPE, usize, usize, *const GUID, *mut *mut c_void) -> HRESULT;
+        let slot = layout::slot(layout::find("ID3D12Device")?, "CreateCommandList")?;
+        let f: F = std::mem::transmute(*vt(dev).add(slot));
+        let hr = f(dev, 0, ty, alloc, init_pso, &iid, &mut out);
+        if hr >= 0 && !out.is_null() {
+            adopt(out, Kind::CommandList);
+        }
+        hr
+    };
+    (hr >= 0 && !out.is_null()).then_some(out)
+}
 creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHeap, [a1]);
 creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
 creator!(dev_create_committed_resource1, "CreateCommittedResource1", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
@@ -3370,7 +3417,13 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
     let key = compute_blob_key(&dxil, rs as usize, copy.Flags.0);
-    let cached = compute_blob(key);
+    let mut cached = compute_blob(key);
+    // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
+    let disk = driver_cache::path(&dxil, copy.Flags.0);
+    let from_disk = cached.is_none();
+    if from_disk {
+        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+    }
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
@@ -3385,12 +3438,20 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     if hr < 0 && cached.is_some() {
         // a blob the driver does not take (another root signature at the same address…): compiled
         forget_compute_blob(key);
+        if from_disk {
+            driver_cache::note(false, disk.as_deref());
+        }
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
         hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     }
     let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
     if hr >= 0 && !reused {
         keep_compute_blob(key, *ppv, dxil.len());
+        if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
+            driver_cache::keep(p, &b, started.elapsed());
+        }
+    } else if reused && from_disk {
+        driver_cache::note(true, None);
     }
     if hr < 0 {
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
@@ -3409,6 +3470,118 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         if reused { ", the driver's blob of an earlier build" } else { "" }
     );
     Some(Ok(hr))
+}
+
+/// The blobs of `COMPUTE_BLOBS`, kept on disk between runs.
+///
+/// `COMPUTE_BLOBS` saves the second build of a program in one run; the first build of every
+/// run still goes through the driver's compiler. On an NVIDIA GPU that is 5 – 27 s for each of
+/// a retail title's larger compute programs when its world loads: the title dispatches without
+/// them meanwhile and is ended before all are built, so the next run starts the same compiles
+/// again. A blob whose build took `KEEP` or longer is written under the hash of its DXIL and
+/// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
+/// driver refuses the blob of another driver, adapter or root signature (the file is dropped
+/// and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
+mod driver_cache {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// builds shorter than this are not worth a file
+    const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static STALE: AtomicU64 = AtomicU64::new(0);
+    static STORED: AtomicU64 = AtomicU64::new(0);
+
+    /// The file of the pipeline made from `dxil` with `flags`.
+    pub fn name(dxil: &[u8], flags: i32) -> String {
+        format!("{:016x}-{:x}-{:x}.pso", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+    }
+
+    pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0")).then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil, flags)))
+    }
+
+    pub fn load(p: &Path) -> Option<Vec<u8>> {
+        std::fs::read(p).ok().filter(|b| !b.is_empty())
+    }
+
+    /// A pipeline was made from a kept blob (`ok`), or the driver refused the blob: dropped.
+    pub fn note(ok: bool, p: Option<&Path>) {
+        if ok {
+            let n = HITS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} compute pipelines made from the driver's blob of an earlier run (kept on disk)");
+            }
+        } else {
+            if let Some(p) = p {
+                let _ = std::fs::remove_file(p);
+            }
+            if STALE.fetch_add(1, Ordering::Relaxed) == 0 {
+                crate::xlog_info!("D3D12.X: a driver blob kept on disk was refused (another driver or adapter?) – such pipelines are compiled again");
+            }
+        }
+    }
+
+    /// `bytes` to `p`, under another name first: a run that is cut short leaves no half file.
+    pub fn write(p: &Path, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+        let ok = std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, p).is_ok();
+        if !ok {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        ok
+    }
+
+    /// Keep `blob`, of a build that took `took`, for the next run.
+    pub fn keep(p: &Path, blob: &[u8], took: std::time::Duration) {
+        if took >= KEEP && write(p, blob) {
+            let n = STORED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} driver blobs kept on disk for the next run (this one: {} ms, {} KB)", took.as_millis(), blob.len() >> 10);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_file_is_named_after_its_dxil_and_flags() {
+            assert_eq!(name(b"abc", 0), name(b"abc", 0));
+            assert_ne!(name(b"abc", 0), name(b"abd", 0));
+            assert_ne!(name(b"abc", 0), name(b"abc", 1));
+            // (the length is in the name: two programs of one hash and different lengths differ)
+            assert!(name(&[0u8; 0x1234], 2).ends_with("-1234-2.pso"));
+        }
+
+        #[test]
+        fn a_kept_blob_is_read_back_and_a_refused_one_is_dropped() {
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-test-{}", std::process::id()));
+            let p = dir.join("driver").join(name(b"program", 0));
+            assert_eq!(load(&p), None, "nothing kept yet");
+            assert!(!write(&p, &[]), "an empty blob is not kept");
+            keep(&p, &[1, 2, 3], std::time::Duration::from_millis(10));
+            assert_eq!(load(&p), None, "a build of milliseconds is not kept");
+            keep(&p, &[1, 2, 3], std::time::Duration::from_secs(1));
+            assert_eq!(load(&p).as_deref(), Some(&[1u8, 2, 3][..]));
+            // no half file under the temporary name
+            assert_eq!(std::fs::read_dir(p.parent().unwrap()).unwrap().count(), 1);
+            // the driver took the blob: it stays; it refused it: gone, the program is compiled again
+            note(true, Some(&p));
+            assert!(p.exists());
+            note(false, Some(&p));
+            assert_eq!(load(&p), None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }
 
 /// The driver's compiled form of translated compute programs (`GetCachedBlob`),
@@ -3649,7 +3822,39 @@ enum OwnedDesc {
 
 unsafe impl Send for OwnedDesc {}
 
+/// A hash of a pipeline's shaders in their order (never 0): what `pso_async` knows a used
+/// pipeline by in the next run.
+fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in blobs {
+        h = (h ^ crate::gpu::shader::fnv64(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h | 1
+}
+
+#[cfg(test)]
+mod shaders_key_tests {
+    #[test]
+    fn a_key_follows_the_shaders_and_their_order_and_is_never_zero() {
+        let (a, b) = (vec![1u8, 2, 3], vec![4u8, 5]);
+        let key = super::shaders_key(&[a.clone(), b.clone()]);
+        assert_eq!(key, super::shaders_key(&[a.clone(), b.clone()]));
+        assert_ne!(key, super::shaders_key(&[b.clone(), a.clone()]));
+        assert_ne!(key, super::shaders_key(&[a.clone()]));
+        assert_ne!(key, super::shaders_key(&[a, vec![4u8, 6]]));
+        assert_ne!(super::shaders_key(&[]), 0);
+    }
+}
+
 impl OwnedDesc {
+    fn shaders_key(&self) -> u64 {
+        shaders_key(match self {
+            OwnedDesc::Compute(_, b) => b,
+            OwnedDesc::Graphics(_, b, ..) => b,
+            OwnedDesc::Stream(_, _, b) => b,
+        })
+    }
+
     fn ptr(&self) -> *const c_void {
         match self {
             OwnedDesc::Compute(d, _) => &**d as *const _ as *const c_void,
@@ -3791,19 +3996,20 @@ unsafe fn go_background(
         return None;
     }
     let dev = Dev(this as usize, f as usize);
-    let submit = if super::pso_async::lazy() { super::pso_async::submit_lazy } else { super::pso_async::submit };
-    submit(
-        *ppv as usize,
-        compute,
-        Box::new(move || {
-            let mut out: *mut c_void = std::ptr::null_mut();
-            if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
-                out as usize
-            } else {
-                0
-            }
-        }),
-    );
+    let key = owned.shaders_key();
+    let job: super::pso_async::Job = Box::new(move || {
+        let mut out: *mut c_void = std::ptr::null_mut();
+        if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
+            out as usize
+        } else {
+            0
+        }
+    });
+    if super::pso_async::lazy() {
+        super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
+    } else {
+        super::pso_async::submit(*ppv as usize, compute, job);
+    }
     Some(hr)
 }
 
@@ -4655,15 +4861,25 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        super::alloc_pool::forget(this as usize);
         super::list_x::on_allocator_release(this as usize);
     }
     n
 }
 
-unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
+/// Reset the (adopted) PC allocator `raw` itself.
+pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
-    let hr = f(this);
+    let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "Reset")));
+    f(raw)
+}
+
+unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
+    // (lists may still hold recordings on it that the title submits again: `alloc_pool`)
+    let hr = match super::alloc_pool::title_reset(this) {
+        Some(hr) => hr,
+        None => reset_pc_allocator(this),
+    };
     if hr >= 0 {
         // the GPU is done with what lists recorded from this allocator used
         super::console_list::allocator_reset(this);
@@ -4747,10 +4963,19 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
     match older {
         // Signal / Wait take a fence: anything else is not one of them
         14 | 15 if is_fence(a1) => {
+            if older == 14 {
+                super::list_x::break_cycles_before_title_signal(this as usize, a1, a2 as u64);
+            }
             let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(if older == 14 { PC_SIGNAL } else { PC_WAIT }));
             let hr = f(this, a1, a2);
-            if older == 14 && hr >= 0 {
-                super::fence_x::note_queue_signal(a1, a2 as u64);
+            if hr >= 0 {
+                if older == 14 {
+                    super::fence_x::note_queue_signal(a1, a2 as u64);
+                    super::list_x::note_title_queue_signal(this as usize, a1, a2 as u64);
+                } else {
+                    super::fence_x::note_queue_wait(a1, a2 as u64);
+                    super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
+                }
             }
             hr as u32 as usize
         }
@@ -4834,10 +5059,12 @@ queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
 /// never released, and the garbage collector ended the game after 10 s.)
 unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, value: u64, _flags: u32) -> HRESULT {
     const PC_SIGNAL: usize = 14;
+    super::list_x::break_cycles_before_title_signal(this as usize, fence as usize, value);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SIGNAL));
     let hr = f(this, fence, value);
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
+        super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
     }
     hr
 }
@@ -4860,14 +5087,21 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     }
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
-    // console-shaped lists run as the PC lists they were translated into
-    let mapped: Vec<*mut c_void> = std::slice::from_raw_parts(lists, n as usize)
-        .iter()
-        .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
-        .collect();
+    // console-shaped lists run as the PC lists they were translated into (split title lists expand
+    // into all of their recorded PC segments in exact chronological order)
+    let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
+    for &l in std::slice::from_raw_parts(lists, n as usize) {
+        if let Some(pc) = super::console_list::pc_list(l) {
+            mapped.push(pc);
+        } else if !super::title_list::push_segments(l, &mut mapped) {
+            mapped.push(l);
+        }
+    }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
-    super::list_x::execute_with_waits(&mapped, |chunk| {
+    super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
+        super::alloc_pool::executed(this, chunk);
+        super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
     });
