@@ -31,11 +31,16 @@ pub struct Knobs {
     /// percent of operations that are LDS reads / writes, and global or scalar memory accesses
     pub lds_pct: u32,
     pub mem_pct: u32,
+    /// programs whose result does not depend on the order lanes see each other's memory
+    /// accesses, for running and comparing them: global loads and scalar loads read only bytes
+    /// 0..1024, every global store writes the lane's own dword at byte 1024 + lane * 4, and the
+    /// lane's LDS dword is written before anything reads it
+    pub race_free: bool,
 }
 
 impl Default for Knobs {
     fn default() -> Self {
-        Knobs { seed: 1, ops: 200, if_depth: 2, divergent_pct: 10, loops: 0, loop_depth: 1, loop_trips: 4, wave64: true, vgprs: 16, sgprs: 8, lds_pct: 5, mem_pct: 10 }
+        Knobs { seed: 1, ops: 200, if_depth: 2, divergent_pct: 10, loops: 0, loop_depth: 1, loop_trips: 4, wave64: true, vgprs: 16, sgprs: 8, lds_pct: 5, mem_pct: 10, race_free: false }
     }
 }
 
@@ -90,8 +95,15 @@ impl Gen<'_> {
         let r = self.rng.below(100) as u32;
         if r < self.k.mem_pct {
             return match self.rng.below(3) {
-                0 => inst("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", self.vgpr()), ("ADDR", 1), ("SADDR", 2), ("OFFSET", 4 * self.rng.below(256))], None),
-                1 => inst("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", self.vgpr()), ("SADDR", 2), ("OFFSET", 4 * self.rng.below(256))], None),
+                // race-free: lane * 4 + offset stays below byte 1024 (63 * 4 + 192 * 4 = 1020)
+                0 => inst("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", self.vgpr()), ("ADDR", 1), ("SADDR", 2), ("OFFSET", 4 * self.rng.below(if self.k.race_free { 193 } else { 256 }))], None),
+                1 => {
+                    // the data register is drawn before the offset, as before, so programs without
+                    // race_free stay the same
+                    let data = self.vgpr();
+                    let offset = if self.k.race_free { 1024 } else { 4 * self.rng.below(256) };
+                    inst("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", data), ("SADDR", 2), ("OFFSET", offset)], None)
+                }
                 _ => inst("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", self.sgpr()), ("SBASE", 1), ("OFFSET", 4 * self.rng.below(256))], None),
             };
         }
@@ -172,6 +184,9 @@ pub fn program(k: &Knobs) -> Vec<u8> {
     assert!(k.lds_pct + k.mem_pct <= 100 && k.divergent_pct <= 100, "{k:?}");
     let mut g = Gen { k, rng: Rng(k.seed) };
     let mut v = inst("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None); // v1 = lane * 4
+    if k.race_free {
+        v.extend(inst("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None)); // the lane's LDS dword = lane id
+    }
     let (loops, levels) = (k.loops as usize, k.loop_depth as usize);
     // every loop level runs at least one operation, so the program would get more than `ops`
     assert!(k.ops / 2 >= loops * levels, "too few operations: ops {} for {loops} loops × {levels} levels needs ops ≥ {}", k.ops, 2 * loops * levels);
