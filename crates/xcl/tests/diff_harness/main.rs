@@ -85,20 +85,34 @@ fn default_knobs(seed: u64) -> gen::Knobs {
     gen::Knobs {
         seed, ops: 200, if_depth: 2, divergent_pct: 25, loops: 1, loop_depth: 1,
         loop_trips: 8, wave64: true, vgprs: 32, sgprs: 8, lds_pct: 10, mem_pct: 15,
+        race_free: true,
     }
 }
 
-/// Run one program through both paths and compare. Returns Ok(()) on match, Err on diff.
-fn run_one(seed: u64) -> Result<(), String> {
-    let (code, state, mem) = runnable::runnable(&default_knobs(seed));
+/// Run one program through both paths and compare. Ok(true) when they match and the program
+/// changed something (memory, or a VGPR beyond its starting value), Ok(false) when they match
+/// trivially, Err on a difference. Memory starts non-zero, so loads bring real values in.
+/// Each path runs twice: a path that disagrees with itself is reported as "unstable A" or
+/// "unstable B" instead of as a difference between the paths.
+fn run_one(seed: u64) -> Result<bool, String> {
+    let (code, state, mem) = runnable_with_data(&default_knobs(seed));
     let dxil_a = compile_a(&code)?;
     let dxil_b = compile_b(&code)?;
     let ra = runner::run(&dxil_a, &state, &mem)?;
     let rb = runner::run(&dxil_b, &state, &mem)?;
-    let diffs = compare::compare(&ra, &rb);
-    if diffs.is_empty() { Ok(()) } else {
-        Err(format!("seed {seed}: {} diffs:\n{}", diffs.len(), compare::format_diffs(&diffs, 10)))
+    for (name, dxil, first) in [("A", &dxil_a, &ra), ("B", &dxil_b, &rb)] {
+        let again = compare::compare(first, &runner::run(dxil, &state, &mem)?);
+        if !again.is_empty() {
+            return Err(format!("unstable {name}: seed {seed}: {} diffs between two runs:\n{}", again.len(), compare::format_diffs(&again, 10)));
+        }
     }
+    let diffs = compare::compare(&ra, &rb);
+    if !diffs.is_empty() {
+        return Err(format!("seed {seed}: {} diffs:\n{}", diffs.len(), compare::format_diffs(&diffs, 10)));
+    }
+    let mem_changed = ra.mem.iter().zip(&mem).any(|(a, b)| a != b);
+    let vgpr_changed = ra.vgpr.iter().zip(&state.vgpr).any(|(got, init)| got.iter().zip(init.iter()).any(|(a, b)| a != b));
+    Ok(mem_changed || vgpr_changed)
 }
 
 #[test]
@@ -114,15 +128,16 @@ fn test_single_program() {
 fn test_ci_sweep() {
     if !gpu_and_dxc_ready() { return; }
     let differential = is_differential();
-    let (mut tested, mut skipped) = (0u32, 0u32);
+    let (mut tested, mut skipped, mut nontrivial) = (0u32, 0u32, 0u32);
     for seed in 0..32u64 {
         match run_one(seed) {
-            Ok(()) => tested += 1,
+            Ok(changed) => { tested += 1; nontrivial += changed as u32; }
             Err(e) if e.starts_with("unsupported") => { skipped += 1; }
             Err(e) => panic!("{e}"),
         }
     }
-    eprintln!("ci_sweep: {tested} tested, {skipped} skipped, differential={differential}");
+    eprintln!("ci_sweep: {tested} tested, {nontrivial} changed memory or registers, {skipped} skipped, differential={differential}");
+    assert!(nontrivial * 10 >= tested * 9, "most programs must change something, or the comparison proves little: {nontrivial} of {tested}");
 }
 
 #[test]
@@ -130,16 +145,20 @@ fn test_ci_sweep() {
 fn test_long_sweep() {
     if !gpu_and_dxc_ready() { return; }
     let differential = is_differential();
-    let (mut tested, mut failures) = (0u32, 0u32);
+    let (mut tested, mut failures, mut nontrivial, mut unstable_a, mut unstable_b) = (0u32, 0u32, 0u32, 0u32, 0u32);
     for seed in 0..1000u64 {
         match run_one(seed) {
-            Ok(()) => tested += 1,
+            Ok(changed) => { tested += 1; nontrivial += changed as u32; }
             Err(e) if e.starts_with("unsupported") => {}
+            Err(e) if e.starts_with("unstable A") => { eprintln!("{e}"); unstable_a += 1; }
+            Err(e) if e.starts_with("unstable B") => { eprintln!("{e}"); unstable_b += 1; }
             Err(e) => { eprintln!("{e}"); failures += 1; }
         }
     }
-    eprintln!("long_sweep: {tested} tested, {failures} failures, differential={differential}");
+    eprintln!("long_sweep: {tested} tested, {nontrivial} changed memory or registers, {failures} differences, {unstable_a} unstable on A, {unstable_b} unstable on B, differential={differential}");
+    assert_eq!(unstable_b, 0);
     assert_eq!(failures, 0);
+    assert!(nontrivial * 10 >= tested * 9, "most programs must change something, or the comparison proves little: {nontrivial} of {tested}");
 }
 
 #[test]
@@ -276,4 +295,36 @@ fn test_dxil_valid() {
     }
     eprintln!("dxil_valid: {validated}/8 validated");
     assert!(validated >= 6, "too many programs failed to compile: only {validated}/8");
+}
+
+/// Diagnostic for one seed (XCL_DIFF_SEED): runs each path twice to show whether a
+/// difference is the translation or a race in the generated program, then minimises it.
+#[test]
+#[ignore]
+fn explain_seed() {
+    if !gpu_and_dxc_ready() { return; }
+    let Some(seed) = std::env::var("XCL_DIFF_SEED").ok().and_then(|s| s.parse::<u64>().ok()) else { return };
+    let knobs = default_knobs(seed);
+    let (code, state, mem) = runnable_with_data(&knobs);
+    let (a, b) = (compile_a(&code).unwrap(), compile_b(&code).unwrap());
+    let ra1 = runner::run(&a, &state, &mem).unwrap();
+    let ra2 = runner::run(&a, &state, &mem).unwrap();
+    let rb1 = runner::run(&b, &state, &mem).unwrap();
+    let rb2 = runner::run(&b, &state, &mem).unwrap();
+    let ab = compare::compare(&ra1, &rb1);
+    eprintln!("explain seed {seed}: A vs A {} diffs, B vs B {} diffs, A vs B {} diffs",
+        compare::compare(&ra1, &ra2).len(), compare::compare(&rb1, &rb2).len(), ab.len());
+    eprintln!("{}", compare::format_diffs(&ab, 12));
+    let differs = |c: &[u8]| -> bool {
+        let (Ok(x), Ok(y)) = (compile_a(c), compile_b(c)) else { return false };
+        let (Ok(rx), Ok(ry)) = (runner::run(&x, &state, &mem), runner::run(&y, &state, &mem)) else { return false };
+        !compare::compare(&rx, &ry).is_empty()
+    };
+    let shrunk = minimise::minimise_ops(&knobs, &|k| differs(&runnable_with_data(k).0));
+    let (c, _, _) = runnable_with_data(&shrunk);
+    let min = minimise::minimise_instructions(&c, &shrunk.options(), &differs);
+    minimise::print_minimised(&shrunk, &min);
+    let (x, y) = (compile_a(&min).unwrap(), compile_b(&min).unwrap());
+    let d = compare::compare(&runner::run(&x, &state, &mem).unwrap(), &runner::run(&y, &state, &mem).unwrap());
+    eprintln!("minimised: {} diffs\n{}", d.len(), compare::format_diffs(&d, 12));
 }

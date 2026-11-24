@@ -40,6 +40,11 @@ pub fn minimise_instructions(
     let mut i = lines.len() - 2; // skip s_endpgm
     while i >= 1 { // skip prologue at index 0
         let l = &lines[i];
+        if keeps_structure(&l.text) {
+            if i == 1 { break; }
+            i -= 1;
+            continue;
+        }
         let start = l.pc as usize;
         let len = l.bytes.len();
         // Build a patched copy with this instruction NOPed
@@ -59,6 +64,18 @@ pub fn minimise_instructions(
         i -= 1;
     }
     best
+}
+
+/// Branches, exec masks, the compares that feed them and the loop counters (s80 and up) are
+/// kept: NOPing one of them changes the program's shape (an endless loop, a branch on a stale
+/// mask) and turns a translation difference into a different program.
+fn keeps_structure(text: &str) -> bool {
+    let t = text.trim();
+    t.starts_with("s_cbranch") || t.starts_with("s_branch") || t.contains("saveexec")
+        || t.contains("exec") || t.starts_with("v_cmp") || t.starts_with("s_cmp")
+        || t.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| {
+            w.strip_prefix('s').and_then(|n| n.parse::<u32>().ok()).is_some_and(|n| (80..96).contains(&n))
+        })
 }
 
 /// Print a minimised program's disassembly to stderr for use as a fixed regression test.
