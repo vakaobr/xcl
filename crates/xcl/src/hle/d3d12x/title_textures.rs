@@ -846,10 +846,19 @@ unsafe fn refresh_once(queue: *mut c_void) {
 static LAST_CONTENT: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
 static UNCHANGED: AtomicU64 = AtomicU64::new(0);
 
-/// `XCL_TEXTURE_SKIP_UNCHANGED=0` uploads a texture whenever its pages were written, as before.
+/// `XCL_TEXTURE_SKIP_UNCHANGED=0` uploads a texture whenever its pages were written, as before;
+/// `=1` leaves unchanged ones out. Unset: left out everywhere but on a Mac (`util::mac_host`).
+/// There a retail game's frame is one flat grey from its first picture on with the skip (the
+/// sign-in screen, the video, every menu) and as it should be without – seen in two runs of
+/// one build; which upload it is that must go up again with the same bytes is not known. Little
+/// is lost there: textures in memory that is not write-watched – all of the title's own on that
+/// host – go up when their content changed (`poll_unwatched`), not when a page was written.
 fn unchanged_skip() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_TEXTURE_SKIP_UNCHANGED").map_or(true, |v| v.trim() != "0"))
+    *ON.get_or_init(|| match std::env::var("XCL_TEXTURE_SKIP_UNCHANGED") {
+        Ok(v) => v.trim() != "0",
+        Err(_) => !crate::util::mac_host(),
+    })
 }
 
 /// Whether texture `res` was last uploaded from memory with hash `h`; `h` is remembered as its
