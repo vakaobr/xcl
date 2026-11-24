@@ -18,6 +18,7 @@ mod runnable;
 
 use xcl::gpu::recomp::{dxc, translate, Options};
 use xcl::gpu::recomp::runner;
+use xcl::gpu::dxil::validate;
 
 fn gpu_and_dxc_ready() -> bool {
     if runner::adapter().is_err() {
@@ -54,36 +55,30 @@ fn validate_dxil(dxil: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Path A: HLSL, native wave64 where the hardware has it, split otherwise.
+/// Path A: HLSL, split wave64 (the production form on 32-lane GPUs).
 fn compile_a(code: &[u8]) -> Result<Vec<u8>, String> {
-    let opts = if runner::wave64_supported() == Ok(true) && !runner::split_wave64() {
-        Options { wave64: true, split_wave64: false, ..Options::default() }
-    } else {
-        Options { wave64: true, split_wave64: true, ..Options::default() }
-    };
-    let t = translate(code, &opts)?;
-    if !t.complete() { return Err(format!("unsupported: {:?}", t.unsupported)); }
-    let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[])?;
-    validate_dxil(&dxil)?;
-    Ok(dxil)
-}
-
-/// Path B: today the HLSL split-wave64 path (a real differential vs path A on wave64 HW;
-/// identity on wave32-only). When XCL_DIRECT_DXIL=1 is set and the direct backend exists
-/// (PR #1426, bmjask), replace the body with:
-///   runner::direct_kernel(code, true)
-/// When XCL_RECOMP_DXIL=1 is set (gefydev recomp-lane-masks), replace with its translate.
-fn compile_b(code: &[u8]) -> Result<Vec<u8>, String> {
     let opts = Options { wave64: true, split_wave64: true, ..Options::default() };
     let t = translate(code, &opts)?;
     if !t.complete() { return Err(format!("unsupported: {:?}", t.unsupported)); }
     let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[])?;
     validate_dxil(&dxil)?;
+    validate::validate(&dxil).map_err(|e| format!("IDxcValidator (path A): {e}"))?;
+    Ok(dxil)
+}
+
+/// Path B: the direct DXIL backend (#1426, bmjask). The container has an in-tree digest
+/// (no DXC at run time). The IDxcValidator check is the interesting case: does dxil.dll
+/// accept bmjask's containers? Every emitted blob goes through both the structural check
+/// and the validator.
+fn compile_b(code: &[u8]) -> Result<Vec<u8>, String> {
+    let dxil = runner::direct_kernel(code, true)?;
+    validate_dxil(&dxil)?;
+    validate::validate(&dxil).map_err(|e| format!("IDxcValidator (path B / direct): {e}"))?;
     Ok(dxil)
 }
 
 fn is_differential() -> bool {
-    runner::wave64_supported() == Ok(true) && !runner::split_wave64()
+    true // always a real differential: HLSL vs direct DXIL
 }
 
 fn default_knobs(seed: u64) -> gen::Knobs {
