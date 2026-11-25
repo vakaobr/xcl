@@ -38,6 +38,15 @@ use crate::util::{HRESULT, E_INVALIDARG, E_NOINTERFACE, E_OUTOFMEMORY, S_FALSE, 
 const DLL: &str = "d3d12_xs.dll";
 const EXTRA_SLOTS: usize = 64;
 const MAX_SCAN: usize = 512;
+/// Words of a native host's own table mirrored in front of its extended vtable. A C++ object's
+/// table pointer is also the way to the words in front of the table: type information and
+/// offset-to-top (Itanium ABI), and before those the virtual-base and virtual-call offsets of a
+/// class with virtual inheritance. A host that runs `dynamic_cast` on an object it is handed, or
+/// adjusts `this` through those offsets (Apple's D3DMetal does both), reads them through the
+/// object's table pointer.
+const NATIVE_HOST_PREFIX: usize = 16;
+/// Words of a native host's method table kept after XCL's slots (see `class_for`).
+const NATIVE_HOST_TAIL: usize = 512;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Kind {
@@ -622,15 +631,55 @@ struct Class {
 
 static CLASSES: Mutex<Vec<Class>> = Mutex::new(Vec::new());
 static EXTS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+/// (extended vtable, original table) of the tables made for a native host. Such a table has the
+/// host's own words in front of it, where every other table has the original's address
+/// (`orig_table`). Read without a lock: the list is replaced as a whole when a table is added and
+/// the old one is left alone (a few dozen tables in a run).
+static NATIVE_EXTS: std::sync::atomic::AtomicPtr<Vec<(usize, usize)>> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 unsafe fn vt(obj: *mut c_void) -> *const usize {
     *(obj as *const *const usize)
 }
 
+/// The original table an extended vtable stands for: the word in front of the table, or on a
+/// native host (whose own words are there) what `note_native_ext` was told.
+unsafe fn orig_table(ext: *const usize) -> usize {
+    let native = NATIVE_EXTS.load(Ordering::Acquire);
+    if !native.is_null() {
+        if let Some(e) = (*native).iter().find(|e| e.0 == ext as usize) {
+            return e.1;
+        }
+    }
+    *ext.sub(1)
+}
+
+fn note_native_ext(ext: usize, orig: usize) {
+    static ADDING: Mutex<()> = Mutex::new(());
+    let _one = ADDING.lock().unwrap();
+    let old = NATIVE_EXTS.load(Ordering::Acquire);
+    // SAFETY: a list is never freed or changed once it is published.
+    let mut list = if old.is_null() { Vec::new() } else { unsafe { (*old).clone() } };
+    list.push((ext, orig));
+    NATIVE_EXTS.store(Box::into_raw(Box::new(list)), Ordering::Release);
+}
+
+/// What an extended vtable has in front of its slots. A host whose methods are in a PE module:
+/// the original table's address, nothing else. A native host: `NATIVE_HOST_PREFIX` words of the
+/// host's own table, as they are in front of it.
+unsafe fn table_header(ot: *const usize, native_host: bool) -> Vec<usize> {
+    if !native_host {
+        return vec![ot as usize];
+    }
+    use windows_sys::Win32::System::Memory::IsBadReadPtr;
+    // (a table at the very start of its mapping has no words in front of it; VirtualQuery does
+    // not know a native host's memory, so it is probed by reading)
+    let there = IsBadReadPtr(ot.sub(NATIVE_HOST_PREFIX) as *const c_void, 8 * NATIVE_HOST_PREFIX) == 0;
+    (1..=NATIVE_HOST_PREFIX).rev().map(|k| if there { *ot.sub(k) } else { 0 }).collect()
+}
+
 /// Original function of `slot` for an adopted object.
 pub unsafe fn orig_fn(this: *mut c_void, slot: usize) -> usize {
-    let ext = vt(this);
-    let orig = *ext.sub(1) as *const usize;
+    let orig = orig_table(vt(this)) as *const usize;
     *orig.add(slot)
 }
 
@@ -731,7 +780,7 @@ pub(super) unsafe fn readopt(obj: *mut c_void, kind: Kind) {
     if obj.is_null() || !is_ext(vt(obj) as usize) {
         return adopt(obj, kind);
     }
-    let orig = *vt(obj).sub(1);
+    let orig = orig_table(vt(obj));
     *(obj as *mut usize) = class_for(obj, orig, kind);
 }
 
@@ -789,8 +838,19 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
         .max()
         .unwrap_or(0);
     let total = (scanned + EXTRA_SLOTS).max(max_console);
-    let mut v: Vec<usize> = Vec::with_capacity(total + 1);
-    v.push(orig);
+    // A host D3D12 whose code is in no PE module (Apple's D3DMetal under Wine on macOS): the
+    // scan above cannot tell where its table ends (it stops at the first word that is in a
+    // module), the host calls virtual methods of its own well past the public ones, and it reads
+    // the words in front of the table (`NATIVE_HOST_PREFIX`). There every slot up to `total` is
+    // taken as the host's and gets the guard – the host's own calls reach the host's word, a
+    // title's XCL's stub or method –, the host's words in front of the table are in front of
+    // XCL's too, and the host's words after `total` follow XCL's slots, so a call of its own
+    // never runs off the end. On any other host nothing here changes.
+    let native_host = m0 == 0;
+    let scanned = if native_host { total } else { scanned };
+    let mut v = table_header(ot, native_host);
+    let hdr = v.len();
+    v.reserve(total + if native_host { NATIVE_HOST_TAIL } else { 0 });
     for i in 0..scanned {
         v.push(*ot.add(i));
     }
@@ -798,17 +858,25 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     for i in public..scanned {
         let info = stubs::new_info(DLL, &format!("{}::#{i} (not on PC)", iface.name), 0);
         info.hook.store(hook, Ordering::Release);
-        v[1 + i] = super::guard::make_guard(v[1 + i], info);
+        v[hdr + i] = super::guard::make_guard(v[hdr + i], info);
     }
     for i in scanned..total {
         let (addr, info) = stubs::make_stub_info(DLL, &format!("{}::#{i} (not on PC)", iface.name), 0);
         info.hook.store(hook, Ordering::Release);
         v.push(addr);
     }
+    if native_host {
+        use windows_sys::Win32::System::Memory::IsBadReadPtr;
+        let mut i = total;
+        while i < public + NATIVE_HOST_TAIL && IsBadReadPtr(ot.add(i) as *const c_void, 8) == 0 {
+            v.push(*ot.add(i));
+            i += 1;
+        }
+    }
     for (method, f) in overrides(kind) {
         if let Some(s) = layout::slot(iface, method) {
             if s < public {
-                v[1 + s] = f;
+                v[hdr + s] = f;
             }
         }
     }
@@ -816,23 +884,23 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     let pc = v.clone();
     for (x, p) in console_remap(kind) {
         if x < public {
-            v[1 + x] = super::guard::make_split(pc[1 + p], pc[1 + x]);
+            v[hdr + x] = super::guard::make_split(pc[hdr + p], pc[hdr + x]);
         } else if x < scanned {
-            v[1 + x] = super::guard::make_split(pc[1 + p], *ot.add(x));
+            v[hdr + x] = super::guard::make_split(pc[hdr + p], *ot.add(x));
         } else if x < total {
-            v[1 + x] = pc[1 + p];
+            v[hdr + x] = pc[hdr + p];
         }
     }
     // slots where the console's method differs from the PC one at the same index
     for (slot, f) in console_slots(kind) {
         if slot < public {
-            v[1 + slot] = super::guard::make_split(f, v[1 + slot]);
+            v[hdr + slot] = super::guard::make_split(f, v[hdr + slot]);
         } else if slot < scanned {
             // an internal method of the runtime there (e.g. queue #30 = PresentX): the title
             // gets the console method, the runtime keeps its own
-            v[1 + slot] = super::guard::make_split(f, *ot.add(slot));
+            v[hdr + slot] = super::guard::make_split(f, *ot.add(slot));
         } else if slot < total {
-            v[1 + slot] = f;
+            v[hdr + slot] = f;
         }
     }
     // the other console extensions (device, command list): a title call is logged and answered
@@ -841,7 +909,7 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
         let own: HashSet<usize> = console_slots(kind).iter().map(|e| e.0).chain(console_remap(kind).iter().map(|e| e.0)).collect();
         for i in (first..public).filter(|i| !own.contains(i)) {
             let (stub, _) = stubs::make_stub_info(DLL, &format!("{}::#{i} (console extension)", iface.name), 0);
-            v[1 + i] = super::guard::make_split(stub, v[1 + i]);
+            v[hdr + i] = super::guard::make_split(stub, v[hdr + i]);
         }
     }
     // methods the newer console layout keeps at other slots: picked at each call
@@ -852,19 +920,26 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             if newer >= total {
                 continue;
             }
-            let pc = if newer < scanned { *ot.add(newer) } else { v[1 + newer] };
-            v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
+            let pc = if newer < scanned { *ot.add(newer) } else { v[hdr + newer] };
+            v[hdr + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[hdr + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
         }
     }
     // XCL_D3D12_TRACE: every public method called from console code is logged
     if std::env::var_os("XCL_D3D12_TRACE").is_some() {
         for i in 0..public {
             let name = format!("{}::{} (#{i})", iface.name, iface.methods.get(i).copied().unwrap_or("?"));
-            v[1 + i] = super::guard::make_tracer(v[1 + i], name);
+            v[hdr + i] = super::guard::make_tracer(v[hdr + i], name);
         }
     }
     let leaked: &'static [usize] = Box::leak(v.into_boxed_slice());
-    let ext = leaked.as_ptr() as usize + 8;
+    let ext = leaked.as_ptr() as usize + 8 * hdr;
+    if native_host {
+        note_native_ext(ext, orig);
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            crate::xlog_warn!("D3D12.X: the host's D3D12 is not in a PE module (a native host: D3DMetal) – its tables keep the host's {NATIVE_HOST_PREFIX} words in front and its words after XCL's slots");
+        }
+    }
     EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(ext);
     crate::xlog_info!(
         "D3D12.X: {} – {public} PC methods, {} internal slots under the guard, +{EXTRA_SLOTS} stubs ({kind:?}, PC vtable {})",
@@ -7597,6 +7672,43 @@ mod this_first_tests {
         }
         if let Some(g) = EXTS.lock().unwrap().as_mut() {
             g.remove(&vtbl);
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_host_table_tests {
+    use super::*;
+
+    /// A host in a PE module: the word in front of an extended vtable is the original table's
+    /// address, as before. A native host: the host's own words are there, in the host's order,
+    /// and the original table is found by the table's address.
+    #[test]
+    fn a_native_hosts_table_keeps_its_prefix_and_other_tables_keep_theirs() {
+        // a host's table with words in front of it (type information, offsets) and two methods
+        let host: Vec<usize> = (0..NATIVE_HOST_PREFIX + 2).map(|i| 0x1000 + i).collect();
+        let ot = unsafe { host.as_ptr().add(NATIVE_HOST_PREFIX) };
+        unsafe {
+            assert_eq!(table_header(ot, false), [ot as usize], "a PE host: the original's address only");
+            assert_eq!(table_header(ot, true), host[..NATIVE_HOST_PREFIX], "a native host: the words in front of its table");
+        }
+        // a PE host's extended vtable: [original][slots]
+        let pe = [ot as usize, 0];
+        let pe_ext = unsafe { pe.as_ptr().add(1) };
+        let mut pe_obj = [pe_ext as usize];
+        // a native host's: [the host's prefix][slots], the original kept beside it
+        let mut native = unsafe { table_header(ot, true) };
+        let hdr = native.len();
+        native.push(0);
+        let native_ext = unsafe { native.as_ptr().add(hdr) };
+        note_native_ext(native_ext as usize, ot as usize);
+        let mut native_obj = [native_ext as usize];
+        unsafe {
+            assert_eq!(*native_ext.sub(1), host[NATIVE_HOST_PREFIX - 1], "what the host reads in front of the table is its own word");
+            assert_eq!(orig_table(native_ext), ot as usize);
+            assert_eq!(orig_table(pe_ext), ot as usize);
+            assert_eq!(orig_fn(native_obj.as_mut_ptr() as *mut c_void, 1), host[NATIVE_HOST_PREFIX + 1]);
+            assert_eq!(orig_fn(pe_obj.as_mut_ptr() as *mut c_void, 1), host[NATIVE_HOST_PREFIX + 1]);
         }
     }
 }
