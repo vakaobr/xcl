@@ -507,6 +507,18 @@ fn recheck_source(e: &mut Entry) -> bool {
 /// by the GPU). The first upload, if still pending, stays: it runs before the title's submit
 /// that copies.
 pub fn note_gpu_write(res: usize) {
+    if let Some(device) = super::level_tiles::device_of(res) {
+        // (a texture whose levels get memory as they are loaded: what the GPU writes needs
+        // memory under all of it)
+        let d = device as *mut c_void;
+        unsafe {
+            if let Some(dev) = ID3D12Device::from_raw_borrowed(&d) {
+                if let Ok(queue) = upload_queue(dev, device) {
+                    super::level_tiles::map_all(&queue, res);
+                }
+            }
+        }
+    }
     let mut t = TEXTURES.lock().unwrap();
     if let Some(e) = t.get_mut(res) {
         if !e.gpu_written {
@@ -1246,6 +1258,7 @@ unsafe fn upload_batches(todo: Vec<(ID3D12Resource, Upload)>, warned: &AtomicU64
         };
         match own_work(|| {
             super::vram::before_execute(&queue);
+            super::level_tiles::map_for(&queue, &batch);
             texture::upload_batch(dev, &queue, &batch)
         }) {
             Ok(failed) => {

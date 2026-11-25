@@ -1004,6 +1004,11 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             }
         } else {
             placed_hr = super::vram::place_pages(this, va as usize, &pc, state, clear, console_bytes, riid, ppv);
+            // (a streamed texture on a host where video memory is the system's: a reserved
+            // texture whose levels get memory as the title loads them)
+            if placed_hr.is_none() {
+                placed_hr = super::level_tiles::create(this, &pc, state, riid, ppv);
+            }
         }
     }
     let hr = match placed_hr {
