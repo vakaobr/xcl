@@ -675,7 +675,7 @@ impl ListState {
             last.0 = last.0.min(va);
             last.1 = last.1.max(end);
         }
-        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
+        if crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(va as usize)) {
             if self.sparse_writes.is_empty() {
                 SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
             }
@@ -1033,6 +1033,17 @@ fn pick_queue(last_queue: Option<usize>, device: usize, ty: D3D12_COMMAND_LIST_T
 
 fn note_write(list: usize, va: u64, size: u64) {
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
+}
+
+/// A PC copy into `[offset, offset + n)` of console buffer `dst` whose memory the GPU only has
+/// a copy of in a committed window (`Uma::shadowed`: readback buffers live there, and titles
+/// read them through a pointer they keep mapped, without another Map): the bytes come back to
+/// the CPU's view after the submit, like the lists' own memory writes.
+fn note_copy_into(list: usize, dst: usize, offset: u64, n: u64) {
+    let Some(u) = crate::gpu::uma::get().filter(|u| u.shadowed()) else { return };
+    let Some((p, bytes)) = real::console_buffer(dst).filter(|&(p, _)| u.is_committed(p)) else { return };
+    let offset = offset.min(bytes as u64);
+    note_write(list, p as u64 + offset, n.min(bytes as u64 - offset));
 }
 
 // ---------------------------------------------------------------------------------------
@@ -4262,6 +4273,7 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
         }
     }
+    note_copy_into(this as usize, dst, dst_off, n);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
 }
 
@@ -4360,6 +4372,12 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
                 }
             }
         }
+    }
+    if let Some(l) = dst.as_ref().filter(|l| l.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+        // (the rows of the footprint: at most what the copy writes)
+        let f = &l.Anonymous.PlacedFootprint;
+        let n = f.Footprint.RowPitch as u64 * f.Footprint.Height.max(1) as u64 * f.Footprint.Depth.max(1) as u64;
+        note_copy_into(this as usize, transmute_copy::<_, usize>(&l.pResource), f.Offset, n);
     }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
     pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
@@ -4496,6 +4514,7 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
     }
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
+        note_copy_into(this as usize, dst, 0, u64::MAX);
         return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
     }
     let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);
@@ -4554,6 +4573,8 @@ pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize,
 /// over the resolved data (after it, in COPY_DEST as ResolveQueryData wants the destination).
 /// Buffers placed below their console address add `buffer_delta(dest)` to the destination offset.
 pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, first: u32, count: u32, dest: usize, offset: u64) {
+    // (8 bytes a query; pipeline statistics, the largest, are 11 values)
+    note_copy_into(this as usize, dest, offset, count as u64 * if ty == D3D12_QUERY_TYPE_PIPELINE_STATISTICS { 88 } else { 8 });
     let pc_offset = offset.saturating_add(real::buffer_delta(dest));
     type F = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
     pc::<F>(this, PC_RESOLVE_QUERY_DATA)(this, heap, ty, first, count, dest, pc_offset);

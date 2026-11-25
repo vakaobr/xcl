@@ -4350,7 +4350,10 @@ fn gpu_uma_import_check_at_init() {
     }
     assert_eq!(crate::hle::d3d12x::backend(), crate::hle::d3d12x::Backend::Real, "real D3D12.X backend");
     let s = crate::hle::d3d12x::real::stats().uma_import_check;
-    assert!(s.starts_with("ok") || s.starts_with("off"), "{s}");
+    // a committed window the GPU only has a copy of (no host-memory heaps): there is no import
+    // to check, and only that window may say so
+    let shadowed = crate::gpu::uma::get().is_some_and(|u| u.shadowed());
+    assert!(s.starts_with("ok") || s.starts_with("off") || (shadowed && s.starts_with("not run: the coherent window has a copy in video memory")), "{s}");
 }
 
 /// End-to-end GPU test of the sparse-window VRAM runtime layout:
@@ -4484,8 +4487,16 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
             }
         };
 
+        // a window the GPU has a copy of: what the shader stored comes back on request
+        let gpu_wrote = || {
+            if u.shadowed() {
+                crate::hle::d3d12x::sparse::readback_now(out_buf, 256);
+            }
+        };
+
         // Submit 1: reads slot 0 -> in_a (sparse VRAM) + arg_table constant 77 (Window 3)
         record_and_run(1, true);
+        gpu_wrote();
         // the copy back of what the shader stored lands asynchronously: before a CPU read the
         // title's lists are done for, XCL settles it (as in Map and the CPU memory waits)
         crate::hle::d3d12x::sparse::settle_readbacks();
@@ -4499,11 +4510,20 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
         *((in_b + 4 * 3) as *mut u32) = 9999;
         crate::hle::d3d12x::console_heap::write(&slot0, &vsharp(in_b));
         record_and_run(2, false);
+        gpu_wrote();
         crate::hle::d3d12x::sparse::settle_readbacks();
         for l in 0..64usize {
             let expected = if l == 3 { 9999 + 13 } else { 5000 + 2 * l as u32 + 13 };
             let got = *((out_buf + 4 * l) as *const u32);
             assert_eq!(got, expected, "submit 2 (mutated sparse descriptor + XMem buffer) lane {l} mismatch");
+        }
+
+        // Submits 3..: a constant the CPU rewrites before every submit reaches the shader each time
+        for n in 0..40u32 {
+            *(arg_table as *mut u32) = 100 + n;
+            record_and_run(3 + n as u64, false);
+            gpu_wrote();
+            assert_eq!(*(out_buf as *const u32), 5000 + 100 + n, "submit {} (constant rewritten in window 3)", 3 + n);
         }
 
         // Clean up

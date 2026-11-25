@@ -307,40 +307,78 @@ unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs
     Ok(format!("ok, {} window(s), {} µs", probes.len(), t0.elapsed().as_micros()))
 }
 
+/// `XCL_UMA_SHADOW`: 1 = the committed windows get GPU copies without asking for a heap over
+/// them (to try the path on a GPU that has `OpenExistingHeapFromAddress`), 0 = never.
+fn shadow_choice() -> Option<bool> {
+    std::env::var("XCL_UMA_SHADOW").ok().map(|v| v != "0")
+}
+
 unsafe fn open_uma(device: &ID3D12Device) {
     let Some(u) = crate::gpu::uma::get() else {
         *UMA_ERROR.lock().unwrap() = "no UMA region".into();
         return;
     };
-    let open = |k: usize| -> Result<(usize, u64, usize), String> {
-        let (base, size) = u.window(k);
+    let buffer = |size: usize, flags: D3D12_RESOURCE_FLAGS| D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: flags,
+        ..Default::default()
+    };
+    let open = |k: usize| -> Result<Option<ID3D12Heap>, String> {
+        if shadow_choice() == Some(true) {
+            return Ok(None);
+        }
         let dev3: ID3D12Device3 = device.cast().map_err(|e| format!("ID3D12Device3: {e}"))?;
-        let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(base as *const c_void).map_err(|e| format!("OpenExistingHeapFromAddress (window {k}): {e}"))?;
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size as u64,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
-            ..Default::default()
+        match dev3.OpenExistingHeapFromAddress::<ID3D12Heap>(u.window(k).0 as *const c_void) {
+            Ok(heap) => Ok(Some(heap)),
+            Err(e) if e.code() == windows::Win32::Foundation::E_NOTIMPL && shadow_choice() != Some(false) => {
+                *UMA_ERROR.lock().unwrap() = format!("OpenExistingHeapFromAddress (window {k}): {e}");
+                Ok(None)
+            }
+            Err(e) => Err(format!("OpenExistingHeapFromAddress (window {k}): {e}")),
+        }
+    };
+    let shadow = |k: usize| -> Result<ID3D12Heap, String> {
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: u.window(k).1 as u64,
+            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
         };
-        let mut buf: Option<ID3D12Resource> = None;
-        device.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buf).map_err(|e| format!("CreatePlacedResource: {e}"))?;
-        let buf = buf.ok_or("CreatePlacedResource")?;
-        let va = buf.GetGPUVirtualAddress();
-        Ok((buf.into_raw() as usize, va, heap.into_raw() as usize))
+        let mut heap: Option<ID3D12Heap> = None;
+        super::title_textures::own_work(|| device.CreateHeap(&desc, &mut heap)).map_err(|e| format!("CreateHeap (window {k}, {} MB of video memory): {e}", u.window(k).1 >> 20))?;
+        heap.ok_or_else(|| "CreateHeap".to_string())
     };
     let n = u.shader_windows();
     let mut bufs: Vec<(usize, u64)> = vec![(0, 0); n];
     let mut heaps: Vec<Option<usize>> = vec![None; n];
+    let mut shadows: Vec<(usize, ID3D12Resource)> = Vec::new();
     for k in 0..n {
         if !u.is_committed_window(k) {
             continue;
         }
-        match open(k) {
+        let made = open(k).and_then(|heap| {
+            let shadowed = heap.is_none();
+            let heap = match heap {
+                Some(h) => h,
+                None => shadow(k)?,
+            };
+            let flags = if shadowed { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS } else { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER };
+            let mut buf: Option<ID3D12Resource> = None;
+            device.CreatePlacedResource(&heap, 0, &buffer(u.window(k).1, flags), D3D12_RESOURCE_STATE_COMMON, None, &mut buf).map_err(|e| format!("CreatePlacedResource: {e}"))?;
+            let buf = buf.ok_or("CreatePlacedResource")?;
+            if shadowed {
+                shadows.push((k, buf.clone()));
+            }
+            let va = buf.GetGPUVirtualAddress();
+            Ok((buf.into_raw() as usize, va, heap.into_raw() as usize))
+        });
+        match made {
             Ok((buf_raw, va, heap_raw)) => {
                 bufs[k] = (buf_raw, va);
                 heaps[k] = Some(heap_raw);
@@ -352,7 +390,9 @@ unsafe fn open_uma(device: &ID3D12Device) {
             }
         }
     }
-    let check = if std::env::var("XCL_UMA_CHECK").is_ok_and(|v| v == "0") {
+    let check = if !shadows.is_empty() {
+        Ok("not run: the coherent window has a copy in video memory (no host-memory heaps on this D3D12)".into())
+    } else if std::env::var("XCL_UMA_CHECK").is_ok_and(|v| v == "0") {
         Ok("off (XCL_UMA_CHECK=0)".into())
     } else {
         check_uma_import(device, u, &bufs)
@@ -376,6 +416,23 @@ unsafe fn open_uma(device: &ID3D12Device) {
         w0_va
     );
     *UMA_HEAPS.lock().unwrap() = heaps;
+    for (k, buf) in &shadows {
+        let (base, size) = u.window(*k);
+        u.set_shadowed();
+        if super::sparse::shadow_window(device, base, size, buf) {
+            crate::xlog_warn!(
+                "D3D12.X: UMA window {k} is not shared with the GPU ({}) \u{2013} {} MB of video memory at VA {:#x} stand for it: CPU writes are uploaded before each submit, GPU writes read back on Map and after the lists' memory writes",
+                match shadow_choice() {
+                    Some(true) => "XCL_UMA_SHADOW=1",
+                    _ => "OpenExistingHeapFromAddress is not implemented",
+                },
+                size >> 20,
+                bufs[*k].1
+            );
+        } else {
+            crate::xlog_warn!("D3D12.X: UMA window {k} is not shared with the GPU and its copy in video memory is not kept in step");
+        }
+    }
     // shaders take the windows from the shared descriptor heap (`pso::heap_windows`)
     if n > 1 && crate::gpu::recomp::pso::heap_windows() {
         let views: Vec<(usize, usize)> = bufs.iter().enumerate().map(|(k, b)| (b.0, u.window(k).1)).collect();
@@ -1497,11 +1554,19 @@ unsafe fn place_console_buffer_sparse(this: *mut c_void, d: &D3D12_RESOURCE_DESC
     None
 }
 
+fn uma_shadowed() -> bool {
+    crate::gpu::uma::get().is_some_and(|u| u.shadowed())
+}
+
 /// Sanitize a console buffer description and initial state for placement in a coherent
 /// cross-adapter UMA heap (`OpenExistingHeapFromAddress`).
 fn sanitize_coherent_buffer(desc: &D3D12_RESOURCE_DESC, state: usize) -> (D3D12_RESOURCE_DESC, u32) {
     let mut d = *desc;
-    d.Flags = D3D12_RESOURCE_FLAGS(d.Flags.0 & 0xFF) | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    d.Flags = D3D12_RESOURCE_FLAGS(d.Flags.0 & 0xFF);
+    // a shadowed window's heap is video memory, not a cross-adapter heap over process memory
+    if !uma_shadowed() {
+        d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    }
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     d.Alignment = 0;
     (d, state as u32 & PC_RESOURCE_STATES)
@@ -1551,6 +1616,10 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
         return None;
     }
     UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, bytes, true));
+    // a readback buffer in a shadowed window: what the GPU copied into it is in video memory
+    if readback_on_null_map && u.shadowed() {
+        note_sparse_readback(*ppv as usize);
+    }
     // Map must hand out the same memory the shaders read (checked once)
     static CHECKED: AtomicU64 = AtomicU64::new(0);
     if CHECKED.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -1596,7 +1665,9 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
         return Some(hr);
     }
     let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
-    d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    if !u.shadowed() {
+        d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    }
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     d.Alignment = 0;
     d.Width = (delta + bytes) as u64;
@@ -1665,7 +1736,7 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
     // a resource in unified memory: its console address (no PC mapping – the PC's would be
     // the start of the PC resource, before the address for a buffer placed below it)
     if let Some((p, bytes)) = console_buffer(this as usize) {
-        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(p)) {
+        if crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(p)) {
             if !range.is_null() {
                 let r = *(range as *const D3D12_RANGE);
                 if r.End > r.Begin {
@@ -3422,7 +3493,7 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
             let d = super::device_x::pc_resource_desc(&x);
             let st = state as u32 & PC_RESOURCE_STATES;
             if let Some(hr) = place_at_title_address(this, block + offset, &d, st, clear as *const c_void, riid, ppv) {
-                if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && cpu_readback && crate::gpu::uma::get().is_some_and(|u| u.is_sparse(block + offset)) {
+                if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && cpu_readback && crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(block + offset)) {
                     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
                     if st == D3D12_RESOURCE_STATE_COPY_DEST.0 as u32 && (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32) == 0 {
                         note_sparse_readback(*ppv as usize);

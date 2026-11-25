@@ -99,6 +99,60 @@ unsafe fn wait_fence(queue: &ID3D12CommandQueue, fence: &ID3D12Fence, value: &mu
     }
 }
 
+/// Whether the host runs a copy that `SetPredication` should skip (D3DMetal 3.0 does: it skips
+/// predicated draws, dispatches and ExecuteIndirect, not copies). A 4-byte copy under
+/// EQUAL_ZERO on eight zero bytes, and the same copy unpredicated, into a readback buffer.
+unsafe fn host_runs_predicated_copies(raw_dev: *mut c_void) -> bool {
+    let dev = ID3D12Device::from_raw_borrowed(&raw_dev).expect("backend device");
+    // predicate (bytes 0..8) and copy source (bytes 8..12); GENERIC_READ includes PREDICATION
+    let upload = buffer(
+        dev,
+        256,
+        D3D12_HEAP_TYPE_UPLOAD,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+    );
+    let readback = buffer(
+        dev,
+        256,
+        D3D12_HEAP_TYPE_READBACK,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    let canary = 0x5843_4C50u32;
+    let mut p = std::ptr::null_mut();
+    upload.Map(0, None, Some(&mut p)).unwrap();
+    (p as *mut u64).write(0);
+    (p as *mut u32).add(2).write(canary);
+    upload.Unmap(0, None);
+
+    let queue: ID3D12CommandQueue = dev
+        .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+            ..Default::default()
+        })
+        .expect("probe CreateCommandQueue");
+    let alloc: ID3D12CommandAllocator = dev
+        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+        .expect("probe CreateCommandAllocator");
+    let list: ID3D12GraphicsCommandList = dev
+        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+        .expect("probe CreateCommandList");
+    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+    list.SetPredication(&upload, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    list.CopyBufferRegion(&readback, 0, &upload, 8, 4);
+    list.SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    list.CopyBufferRegion(&readback, 4, &upload, 8, 4);
+    list.Close().expect("probe Close");
+    let cl: ID3D12CommandList = list.cast().unwrap();
+    queue.ExecuteCommandLists(&[Some(cl)]);
+    wait_fence(&queue, &fence, &mut 0);
+
+    readback.Map(0, None, Some(&mut p)).expect("Map probe readback");
+    let got = std::slice::from_raw_parts(p as *const u32, 2).to_vec();
+    readback.Unmap(0, None);
+    assert_eq!(got[1], canary, "the unpredicated probe copy must run");
+    got[0] == canary
+}
+
 struct ReadbackCtx<'a> {
     queue: &'a ID3D12CommandQueue,
     alloc: &'a ID3D12CommandAllocator,
@@ -177,6 +231,11 @@ fn set_predication_buffer_state_and_kickoff() {
     if real::uma_gpu_va() == 0 {
         println!("UMA not opened on GPU – skipping");
         runner::skip_test("no GPU UMA");
+        return;
+    }
+    if unsafe { host_runs_predicated_copies(real::device_raw()) } {
+        println!("the host runs predicated copies – skipping");
+        runner::skip_test("host ignores SetPredication for copies");
         return;
     }
 

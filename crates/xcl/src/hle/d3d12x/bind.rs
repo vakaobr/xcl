@@ -1019,6 +1019,11 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
+    // shadowed unified memory whose sparse windows could not be made (no reserved resources
+    // either): descriptor tables are read from window 0, and a null root descriptor is not bound
+    if first == 0 && u.shadowed() {
+        return Err("window 0 of unified memory has no buffer on the GPU".into());
+    }
     let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {

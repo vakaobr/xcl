@@ -562,6 +562,100 @@ fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
     }
 }
 
+unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -> windows::core::Result<State> {
+    let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
+    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+    let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+    let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
+    let rb_lanes: Vec<RbLane> = (0..RB_LANES).map_while(|_| rb_lane_new(dev).ok()).collect();
+    let mut slots = Vec::with_capacity(UPLOAD_SLOTS);
+    for _ in 0..UPLOAD_SLOTS {
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)?;
+        list.Close()?;
+        let _ = list.SetName(windows::core::w!("xcl sparse upload list"));
+        let _ = alloc.SetName(windows::core::w!("xcl sparse upload allocator"));
+        slots.push(UploadSlot { alloc, list, fence_val: 0 });
+    }
+    let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+    let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None)?;
+    rb_list.Close()?;
+    let _ = rb_list.SetName(windows::core::w!("xcl sparse readback list"));
+    let _ = rb_alloc.SetName(windows::core::w!("xcl sparse readback allocator"));
+    let _ = queue.SetName(windows::core::w!("xcl sparse queue"));
+    Ok(State {
+        dev: dev.clone(),
+        queue,
+        fence,
+        value: 0,
+        event,
+        rb_fence,
+        rb_value: 0,
+        rb_lanes,
+        rb_seq: 0,
+        rb_landed: Vec::new(),
+        rb_pool: Vec::new(),
+        windows,
+        pools: Vec::new(),
+        free: Vec::new(),
+        retired: Vec::new(),
+        mapped: FxHashMap::default(),
+        pinned: FxHashMap::default(),
+        parked: FxHashMap::default(),
+        quarantined: VecDeque::new(),
+        queue_fences: FxHashMap::default(),
+        buffers: FxHashMap::default(),
+        to_zero: Vec::new(),
+        staging: None,
+        ring_write: 0,
+        ring_submitted: 0,
+        ring_free: 0,
+        inflight: VecDeque::new(),
+        zero_buf: None,
+        slots,
+        next_slot: 0,
+        readback: None,
+        rb_alloc,
+        rb_list,
+        rb_last_fence: 0,
+        waited: FxHashMap::default(),
+        runs: None,
+        scratch_runs: Vec::new(),
+    })
+}
+
+/// pool heap number of the tiles of a shadowed window: they are the window's own buffer, not
+/// pool tiles (never mapped, freed or pinned)
+const SHADOW_POOL: u32 = u32::MAX;
+
+/// A committed window the GPU could not open as a heap (`real::open_uma`): `buf` in video
+/// memory stands for `[base, base + size)` and is kept in step like the tiles of a sparse
+/// window -- the CPU's writes (write-watch, changed 64-byte chunks) go to it before each
+/// ExecuteCommandLists, GPU writes come back on Map and after the lists' memory operations.
+/// All of it counts as mapped from the start: the window is committed. False: no queue for
+/// the copies (the buffer then never sees the CPU's writes).
+pub unsafe fn shadow_window(dev: &ID3D12Device, base: usize, size: usize, buf: &ID3D12Resource) -> bool {
+    let mut g = STATE.lock().unwrap();
+    if g.is_none() {
+        // no sparse window was made (`init`): the copies still need the queue and the lists
+        match new_state(dev, Vec::new()) {
+            Ok(s) => *g = Some(s),
+            Err(e) => {
+                crate::xlog_warn!("shadowed window at {base:#x}: {e}");
+                return false;
+            }
+        }
+    }
+    let Some(s) = g.as_mut() else { return false };
+    s.windows.push((base, buf.clone()));
+    for (i, t) in (base..base + size).step_by(TILE).enumerate() {
+        s.mapped.insert(t, TileEntry::with_holes((SHADOW_POOL, i as u32), 0));
+    }
+    s.runs = None;
+    MAPPED_GEN.fetch_add(1, Ordering::Release);
+    true
+}
+
 /// The sparse windows' buffers on `dev`: `(window_index, buffer_raw, gpu_va)` for each
 /// sparse window in `gpu::uma` (empty: no sparse windows).
 pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
@@ -585,67 +679,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     if out.is_empty() {
         return out;
     }
-    let made = (|| -> windows::core::Result<State> {
-        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
-        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
-        let rb_lanes: Vec<RbLane> = (0..RB_LANES).map_while(|_| rb_lane_new(dev).ok()).collect();
-        let mut slots = Vec::with_capacity(UPLOAD_SLOTS);
-        for _ in 0..UPLOAD_SLOTS {
-            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)?;
-            list.Close()?;
-            let _ = list.SetName(windows::core::w!("xcl sparse upload list"));
-            let _ = alloc.SetName(windows::core::w!("xcl sparse upload allocator"));
-            slots.push(UploadSlot { alloc, list, fence_val: 0 });
-        }
-        let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-        let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None)?;
-        rb_list.Close()?;
-        let _ = rb_list.SetName(windows::core::w!("xcl sparse readback list"));
-        let _ = rb_alloc.SetName(windows::core::w!("xcl sparse readback allocator"));
-        let _ = queue.SetName(windows::core::w!("xcl sparse queue"));
-        Ok(State {
-            dev: dev.clone(),
-            queue,
-            fence,
-            value: 0,
-            event,
-            rb_fence,
-            rb_value: 0,
-            rb_lanes,
-            rb_seq: 0,
-            rb_landed: Vec::new(),
-            rb_pool: Vec::new(),
-            windows,
-            pools: Vec::new(),
-            free: Vec::new(),
-            retired: Vec::new(),
-            mapped: FxHashMap::default(),
-            pinned: FxHashMap::default(),
-            parked: FxHashMap::default(),
-            quarantined: VecDeque::new(),
-            queue_fences: FxHashMap::default(),
-            buffers: FxHashMap::default(),
-            to_zero: Vec::new(),
-            staging: None,
-            ring_write: 0,
-            ring_submitted: 0,
-            ring_free: 0,
-            inflight: VecDeque::new(),
-            zero_buf: None,
-            slots,
-            next_slot: 0,
-            readback: None,
-            rb_alloc,
-            rb_list,
-            rb_last_fence: 0,
-            waited: FxHashMap::default(),
-            runs: None,
-            scratch_runs: Vec::new(),
-        })
-    })();
+    let made = new_state(dev, windows);
     match made {
         Ok(s) => {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());

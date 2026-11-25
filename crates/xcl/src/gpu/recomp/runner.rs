@@ -1480,22 +1480,39 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         let dev = &gpu.dev;
         let dev3: ID3D12Device3 = dev.cast().map_err(e)?;
         let mut bufs: Vec<ID3D12Resource> = Vec::new();
+        // a D3D12 without heaps over process memory (D3DMetal: E_NOTIMPL): each window is a
+        // buffer in video memory, filled from the window before the dispatch and copied back
+        // after it -- (upload, readback) per window
+        let mut copies: Vec<(ID3D12Resource, ID3D12Resource)> = Vec::new();
         for &(base, size) in &arena.windows {
-        let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(base as *const std::ffi::c_void).map_err(|x| format!("OpenExistingHeapFromAddress: {x}"))?;
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size as u64,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
-            ..Default::default()
-        };
-        let mut mem_buf: Option<ID3D12Resource> = None;
-        dev.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut mem_buf).map_err(|x| format!("CreatePlacedResource: {x}"))?;
-        bufs.push(mem_buf.ok_or("arena")?);
+            let heap: ID3D12Heap = match dev3.OpenExistingHeapFromAddress(base as *const std::ffi::c_void) {
+                Ok(h) => h,
+                Err(x) if x.code() == windows::Win32::Foundation::E_NOTIMPL => {
+                    let up = buffer(dev, size as u64, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
+                    let mut p = std::ptr::null_mut();
+                    up.Map(0, None, Some(&mut p)).map_err(e)?;
+                    std::ptr::copy_nonoverlapping(base, p as *mut u8, size);
+                    up.Unmap(0, None);
+                    bufs.push(buffer(dev, size as u64, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?);
+                    copies.push((up, buffer(dev, size as u64, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?));
+                    continue;
+                }
+                Err(x) => return Err(format!("OpenExistingHeapFromAddress: {x}")),
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+                ..Default::default()
+            };
+            let mut mem_buf: Option<ID3D12Resource> = None;
+            dev.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut mem_buf).map_err(|x| format!("CreatePlacedResource: {x}"))?;
+            bufs.push(mem_buf.ok_or("arena")?);
         }
         let mem_buf = bufs[0].clone();
         let pso: ID3D12PipelineState = dev
@@ -1518,13 +1535,18 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).map_err(e)?;
         list.CopyBufferRegion(&io_buf, 0, &upload, 0, io_bytes);
+        // (a buffer in COMMON takes the copy as it is)
+        for (b, (up, _)) in bufs.iter().zip(&copies) {
+            list.CopyBufferRegion(b, 0, up, 0, b.GetDesc().Width);
+        }
+        let filled = if copies.is_empty() { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_COPY_DEST };
         list.ResourceBarrier(&[
             transition(&io_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-            transition(&mem_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&mem_buf, filled, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         for b in &bufs[1..] {
-            list.ResourceBarrier(&[transition(b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            list.ResourceBarrier(&[transition(b, filled, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
         }
         // the windows as raw UAVs at MEM_HEAP_BASE.. of a shader-visible heap
         // (`Options::heap_windows`; programs with the root-UAV switch ignore it)
@@ -1552,18 +1574,28 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
             list.SetComputeRootUnorderedAccessView(2 + k as u32, bufs.get(k).unwrap_or(&mem_buf).GetGPUVirtualAddress());
         }
         list.Dispatch(1, 1, 1);
+        let after = if copies.is_empty() { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_COPY_SOURCE };
         list.ResourceBarrier(&[
             transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            transition(&mem_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+            transition(&mem_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, after),
         ]);
         for b in &bufs[1..] {
-            list.ResourceBarrier(&[transition(b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)]);
+            list.ResourceBarrier(&[transition(b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, after)]);
         }
         list.CopyBufferRegion(&readback, 0, &res_buf, 0, res_bytes);
+        for (b, (_, back)) in bufs.iter().zip(&copies) {
+            list.CopyBufferRegion(back, 0, b, 0, b.GetDesc().Width);
+        }
         list.Close().map_err(e)?;
         gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
         gpu.value += 1;
         wait_for_submission(dev, &gpu.queue, &gpu.fence, gpu.value, "arena dispatch")?;
+        for (&(base, size), (_, back)) in arena.windows.iter().zip(&copies) {
+            let mut q = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut q)).map_err(e)?;
+            std::ptr::copy_nonoverlapping(q as *const u8, base, size);
+            back.Unmap(0, None);
+        }
         let mut q = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut q)).map_err(e)?;
         let raw = std::slice::from_raw_parts(q as *const u32, KERNEL_RES_DWORDS).to_vec();
