@@ -2372,7 +2372,11 @@ fn draw_console_views(
 /// `image_sample_o` in a pixel shader, implicit LOD between two mips (trilinear): the console
 /// moves each mip's texel coordinate by the offset in that mip's texels. A 4-level texture
 /// (8², 4², 2², 1²; level k texel x holds 100·k + x), point min / mag, linear mip, clamp;
-/// u = v = pixel centre · 2^0.25 / 8 gives LOD 0.25; offset (+1, 0).
+/// u = v = pixel centre · 2^0.25 / 8 gives LOD 0.25; offset (+1, 0). The program starts with
+/// `s_wqm`, as a console shader does before an implicit-LOD sample: without it the helper lanes
+/// of a quad an edge splits keep u = v = 0 and the quad's LOD jumps to the last mip (on D3DMetal
+/// quads along a diagonal of this triangle have helper lanes). The mip weights are the host's
+/// own LOD, read by a plain HLSL draw: D3DMetal gives 0.2421875 here, not 0.25.
 #[test]
 fn gpu_ps_image_sample_offset_implicit_lod_between_mips() {
     // S#: clamp u / v / w, point min / mag, MIP_FILTER linear (2), LOD 0..15.99, sampler 0
@@ -2391,9 +2395,10 @@ fn implicit_lod_between_mips(s_sharp: [u32; 4]) {
         return;
     }
     use windows::Win32::Graphics::Direct3D12::*;
-    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_SAMPLE_DESC};
     let scale = 2f32.powf(0.25) / 8.0;
     let ps = prog(&[
+        ("S_WQM_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None),
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 129)], None), // offset x +1, y 0
         ("V_MUL_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 255), ("VSRC1", 2)], Some(scale.to_bits())),
         ("V_MUL_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 3)], Some(scale.to_bits())),
@@ -2430,14 +2435,37 @@ fn implicit_lod_between_mips(s_sharp: [u32; 4]) {
     let mut sgprs = vec![0u32; 32];
     sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
     sgprs[24..28].copy_from_slice(&s_sharp);
-    let px = draw_console_views(None, Some(&ps), &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]], &sgprs, &[tex], &[crate::gpu::desc::sampler_d3d12(&s_sharp, false)]);
+    let tris = [[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]];
+    let samplers = [crate::gpu::desc::sampler_d3d12(&s_sharp, false)];
+    let px = draw_console_views(None, Some(&ps), &tris, &sgprs, std::slice::from_ref(&tex), &samplers);
+    // The host's LOD for the same u / v, texture and sampler (SRV and sampler at heap index 0).
+    let host_vs = super::dxc::compile("float4 main(float2 p : POSITION, float4 c : COLOR) : SV_Position { return float4(p, 0, 1); }", "main", "vs_6_6", &[]).unwrap();
+    let host_ps = super::dxc::compile(
+        &format!(
+            "float4 main(float4 pos : SV_Position) : SV_Target {{ Texture2D<float4> t = ResourceDescriptorHeap[0]; \
+             SamplerState s = SamplerDescriptorHeap[0]; return t.CalculateLevelOfDetail(s, pos.xy * asfloat({:#x}u)).xxxx; }}",
+            scale.to_bits()
+        ),
+        "main",
+        "ps_6_6",
+        &[],
+    )
+    .unwrap();
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
+    ];
+    let verts: Vec<f32> = tris.iter().flat_map(|p| [p[0] / 8.0 - 1.0, 1.0 - p[1] / 8.0, 0.0, 0.0, 0.0, 0.0]).collect();
+    let lods = runner::draw_views(&host_vs, &host_ps, &layout, &verts, 24, &sgprs, &[], &[tex], &samplers, 16, [-1.0; 4]).unwrap();
     for y in 0..16 {
         for x in 0..16 {
             let u = (x as f32 + 0.5) * scale;
             let texel = |size: f32| ((u * size).floor() + 1.0).clamp(0.0, size - 1.0);
-            let want = 0.75 * texel(8.0) + 0.25 * (100.0 + texel(4.0));
+            let lod = lods[y * 16 + x][0];
+            assert!(lod > 0.0 && lod < 1.0, "pixel ({x},{y}): host LOD {lod}, expected one between mips 0 and 1");
+            let want = (1.0 - lod) * texel(8.0) + lod * (100.0 + texel(4.0));
             let got = px[y * 16 + x][0];
-            assert!((got - want).abs() < 0.02, "pixel ({x},{y}) = {got}, expected {want}");
+            assert!((got - want).abs() < 0.02, "pixel ({x},{y}) = {got}, expected {want} (host LOD {lod})");
         }
     }
 }
