@@ -782,14 +782,17 @@ pub(super) fn on_pages() -> bool {
 }
 
 /// Whether sampled title textures (`place_pages`) are tried on shared pages: `XCL_VRAM_ARENAS=1`
-/// – never, `=0` – always; unset: as `on_pages`, and on a Mac (`util::mac_host`) too – there
-/// `place_on_pages` makes them with the flags D3DMetal shares pages with (`native_page_flags`).
-/// GPU-owned textures (`place`) follow `on_pages` alone: on a Mac they keep arenas.
+/// – never, `=0` – always; unset: as `on_pages`. On a Mac `place_on_pages` makes them with the
+/// flags D3DMetal shares pages with (`native_page_flags`), but they get pages under every level
+/// there, where the level tiles (`title_textures`) give a streamed texture memory level by level
+/// once `place_pages` says no: a retail title's loading was at 16.5 GB wired with them on and
+/// 12.3 – 14.0 GB with the level tiles (shortside, #258). So on a Mac they stay off unless
+/// `XCL_VRAM_ARENAS=0`, until the pages map a texture's levels with their texels.
 pub(super) fn sampled_on_pages() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("XCL_VRAM_ARENAS") {
         Ok(v) => v.trim() == "0",
-        Err(_) => on_pages() || crate::util::mac_host(),
+        Err(_) => on_pages(),
     })
 }
 
@@ -826,7 +829,7 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     if !tier2(dev) {
         return None;
     }
-    // on a Mac render targets too, as sampled textures: `place_on_pages` gives them the
+    // on a Mac render targets too, when sampled textures are (`XCL_VRAM_ARENAS=0`): `place_on_pages` gives them the
     // unordered-access flag D3DMetal shares pages with (`native_page_flags`); a render target
     // cleared through one reserved texture read back through another on the same tiles with 0
     // of 4096 texels wrong, a depth target with 3968 (those keep arenas)
@@ -1012,6 +1015,12 @@ mod tests {
     fn render_targets_at_one_address_share_their_pages() {
         let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::gpu::recomp::runner::skip_test;
+        // arenas: XCL_VRAM_ARENAS=1, or a Mac unless =0 (`sampled_on_pages`). Not asked of
+        // on_pages(): it caches its answer, and the native-host flag it reads is set later
+        let arenas = std::env::var("XCL_VRAM_ARENAS").map_or(crate::util::mac_host(), |v| v.trim() != "0");
+        if arenas {
+            return skip_test("title textures are not on shared pages on this host (XCL_VRAM_ARENAS)");
+        }
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::*;
         use windows::Win32::Graphics::Dxgi::*;
