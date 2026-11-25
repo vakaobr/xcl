@@ -173,7 +173,7 @@ mod translated {
                 return 0;
             }
             let id = identity_for(env!("XCL_TRANSLATOR_SOURCE_ID"), super::dxc::toolchain_identity());
-            with_emit_switches(id, |name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned()))
+            with_emit_switches(id, !crate::util::mac_host(), |name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned()))
         })
     }
 
@@ -181,12 +181,16 @@ mod translated {
     /// emitter reads (`XCL_SAFE_BARRIER=0`, `XCL_WAVE64_SPIN=0`, `XCL_X64_ALL_MASKS`,
     /// `XCL_RECOMP_NO_STRUCTURED`) change the translation of the same bytes: without this a run
     /// with one of them set loaded what an earlier run without it had cached. Their defaults
-    /// leave `id` as it is, so existing entries stay valid.
-    pub(super) fn with_emit_switches(id: u64, get: impl Fn(&str) -> Option<String>) -> u64 {
+    /// leave `id` as it is, so existing entries stay valid. `safe_barrier_default` is the
+    /// host's barrier when `XCL_SAFE_BARRIER` is unset (`emit::safe_barrier_enabled`: off on a
+    /// Mac), so `XCL_SAFE_BARRIER=1` there is another translation too.
+    pub(super) fn with_emit_switches(id: u64, safe_barrier_default: bool, get: impl Fn(&str) -> Option<String>) -> u64 {
         let off = |name: &str| get(name).is_some_and(|v| v.trim() == "0");
+        let barrier = get("XCL_SAFE_BARRIER").map(|v| v.trim() != "0");
         let mut tag = String::new();
         for (set, part) in [
-            (off("XCL_SAFE_BARRIER"), "safe-barrier-0;"),
+            (barrier == Some(false) && safe_barrier_default, "safe-barrier-0;"),
+            (barrier == Some(true) && !safe_barrier_default, "safe-barrier-1;"),
             (off("XCL_WAVE64_SPIN"), "wave64-spin-0;"),
             (get("XCL_X64_ALL_MASKS").is_some(), "x64-all-masks;"),
             (get("XCL_RECOMP_NO_STRUCTURED").is_some(), "no-structured;"),
@@ -869,7 +873,7 @@ mod shader_cache_tests {
         let base = identity_for("s", "t");
         let with = |vars: &[(&str, &str)]| {
             let vars: Vec<(String, String)> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            with_emit_switches(base, move |name| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()))
+            with_emit_switches(base, true, move |name| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()))
         };
         assert_eq!(with(&[]), base);
         assert_eq!(with(&[("XCL_SAFE_BARRIER", "1"), ("XCL_WAVE64_SPIN", "1")]), base, "defaults written out");
@@ -886,7 +890,22 @@ mod shader_cache_tests {
         let distinct: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(distinct.len(), ids.len() - 1);
         assert!(ids.iter().all(|&i| i != 0));
-        assert_eq!(with_emit_switches(0, |_| Some("0".into())), 0, "a disabled cache stays disabled");
+        assert_eq!(with_emit_switches(0, true, |_| Some("0".into())), 0, "a disabled cache stays disabled");
+    }
+
+    /// On a Mac the native barrier is the default (`emit::safe_barrier_enabled`): there
+    /// `XCL_SAFE_BARRIER=1` (the spin barrier) is the switch that needs its own entries, and
+    /// `=0` is the default written out.
+    #[test]
+    fn the_barrier_tag_follows_the_hosts_default() {
+        use translated::{identity_for, with_emit_switches};
+        let base = identity_for("s", "t");
+        let mac = |v: Option<&str>| with_emit_switches(base, false, |name| (name == "XCL_SAFE_BARRIER").then(|| v.map(str::to_string)).flatten());
+        assert_eq!(mac(None), base);
+        assert_eq!(mac(Some("0")), base, "the Mac's default written out");
+        assert_ne!(mac(Some("1")), base, "the spin barrier on a Mac");
+        let pc = |v: Option<&str>| with_emit_switches(base, true, |name| (name == "XCL_SAFE_BARRIER").then(|| v.map(str::to_string)).flatten());
+        assert_ne!(mac(Some("1")), pc(Some("0")), "the two non-defaults stay apart");
     }
 
     fn key(hash: u64) -> ShaderKey {
