@@ -177,6 +177,9 @@ pub fn describe_address(addr: usize) -> String {
             return module_offset(&name, h as usize, addr);
         }
     }
+    if crate::loader::in_masked_store_helper(addr) {
+        return format!("{addr:#x} (a masked-store helper)");
+    }
     format!("{addr:#x}")
 }
 

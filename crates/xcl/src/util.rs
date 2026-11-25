@@ -162,6 +162,39 @@ fn mac_host_from(forced: Option<&str>, sysname: Option<&str>) -> bool {
     }
 }
 
+/// The title's code is run by Rosetta 2 rather than by a CPU: the translator says so in the
+/// processor brand string ("VirtualApple @ 2.50GHz processor"). Narrower than `mac_host` (Wine
+/// on an Intel Mac is one and has a CPU) and about the instructions, not the graphics.
+pub fn rosetta() -> bool {
+    static ROSETTA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ROSETTA.get_or_init(|| brand_names_rosetta(&cpu_brand()))
+}
+
+/// CPUID's processor brand string (leaves 0x8000_0002..=4), or nothing where it has none.
+pub fn cpu_brand() -> String {
+    use std::arch::x86_64::__cpuid;
+    // SAFETY: CPUID is part of x86-64; leaf 0x8000_0000 says how far the extended leaves go.
+    #[allow(unused_unsafe)]
+    unsafe {
+        if __cpuid(0x8000_0000).eax < 0x8000_0004 {
+            return String::new();
+        }
+        let mut b = Vec::with_capacity(48);
+        for leaf in 0x8000_0002..=0x8000_0004u32 {
+            let r = __cpuid(leaf);
+            for v in [r.eax, r.ebx, r.ecx, r.edx] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        b.retain(|&c| c != 0);
+        String::from_utf8_lossy(&b).trim().to_string()
+    }
+}
+
+fn brand_names_rosetta(brand: &str) -> bool {
+    brand.starts_with("VirtualApple")
+}
+
 /// Normalised DLL key: lower-case file name, ".dll" appended when no extension.
 pub fn dll_key(name: &str) -> String {
     let base = name.rsplit(['\\', '/']).next().unwrap_or(name);
@@ -537,5 +570,16 @@ mod tests {
             assert_eq!(decode_cp(&buf, CP_UTF8), "a😀");
             assert_eq!(buf[5], 0);
         }
+    }
+
+    /// Rosetta 2 is told from a CPU by the brand string it reports.
+    #[test]
+    fn rosetta_is_named_by_the_brand_string() {
+        assert!(brand_names_rosetta("VirtualApple @ 2.50GHz processor"));
+        assert!(!brand_names_rosetta("AMD Ryzen 7 3700X 8-Core Processor"));
+        assert!(!brand_names_rosetta("Intel(R) Core(TM) i9-9980HK CPU @ 2.40GHz"));
+        assert!(!brand_names_rosetta(""));
+        // this host's: a string, and the answer that goes with it
+        assert_eq!(rosetta(), cpu_brand().starts_with("VirtualApple"));
     }
 }

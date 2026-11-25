@@ -970,6 +970,58 @@ pub fn start_probes() {
     });
 }
 
+/// Free address space for helpers within reach of a `call rel32` from `near`: the nearest
+/// `size` bytes (a multiple of 64 KiB) above it, else below; committed, readable, writable and
+/// executable. 0: none.
+pub(crate) unsafe fn alloc_near(near: usize, size: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_FREE, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+    const REACH: usize = 0x7000_0000;
+    let query = |at: usize| -> Option<(usize, usize, bool)> {
+        let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        (VirtualQuery(at as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) != 0)
+            .then(|| (mbi.BaseAddress as usize, (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize), mbi.State == MEM_FREE))
+    };
+    let take = |p: usize| VirtualAlloc(p as *const _, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize;
+    let mut at = near & !0xFFFF;
+    for _ in 0..4096 {
+        let Some((_, end, free)) = query(at) else { break };
+        if at - (near & !0xFFFF) > REACH {
+            break;
+        }
+        if free && at + size <= end {
+            let p = take(at);
+            if p != 0 {
+                return p;
+            }
+        }
+        let next = end.saturating_add(0xFFFF) & !0xFFFF;
+        if next <= at {
+            break;
+        }
+        at = next;
+    }
+    let mut at = near & !0xFFFF;
+    for _ in 0..4096 {
+        if at <= 0x2_0000 || (near & !0xFFFF) - at > REACH {
+            break;
+        }
+        let Some((base, _, free)) = query(at - 1) else { break };
+        let p = at.saturating_sub(size);
+        if free && p >= base {
+            let p = take(p);
+            if p != 0 {
+                return p;
+            }
+        }
+        let next = base & !0xFFFF;
+        if next >= at {
+            break;
+        }
+        at = next;
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

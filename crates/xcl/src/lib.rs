@@ -20,6 +20,7 @@ pub mod insn;
 pub mod inspect;
 pub mod launcher;
 pub mod loader;
+pub mod maskmov;
 pub mod modules;
 pub mod pe;
 pub mod preflight;
