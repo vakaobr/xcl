@@ -2,7 +2,7 @@
 # prints an `xcl-smoke` block to paste into the PR's "Regression run" section – once built
 # from main, once from the PR's head commit (CONTRIBUTING.md, "What a PR needs to be merged").
 #
-#   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe] [-Title <label>] [-OutDir <path>]
+#   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe] [-Title <label>] [-OutDir <path>] [-StartupTimeoutSeconds 120]
 #
 # The block's `title:` line is the first 8 hex digits of the SHA-256 of the game folder's name
 # (trimmed, UTF-8), not the name itself, so PR descriptions do not name anyone's copy of a game (#677);
@@ -14,7 +14,9 @@ param(
     [int]$Seconds = 60,
     [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe'),
     [string]$Title,
-    [string]$OutDir
+    [string]$OutDir,
+    # Additional time for launcher work such as shader preparation before the guest timer starts.
+    [ValidateRange(1,86400)][int]$StartupTimeoutSeconds = 120
 )
 $ErrorActionPreference = 'Stop'
 
@@ -59,7 +61,7 @@ $env:XCL_ACTIVITY = '1'
 $null = $p.Start()
 $stdoutTask = $p.StandardOutput.ReadToEndAsync()
 $stderrTask = $p.StandardError.ReadToEndAsync()
-if (-not $p.WaitForExit(($Seconds + 120) * 1000)) {
+if (-not $p.WaitForExit(($Seconds + $StartupTimeoutSeconds) * 1000)) {
     if (-not $p.HasExited) { $p.Kill() }
     $timedOut = $true
 }
@@ -107,6 +109,7 @@ if ($OutDir) {
         gpu            = $gpu
         title          = $Title
         seconds        = $Seconds
+        startup_timeout_seconds = $StartupTimeoutSeconds
         exit           = $code
         frames         = $frames
         presents       = $lastPresents
