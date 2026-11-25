@@ -268,12 +268,34 @@ mod translated {
                 identity_for(&id.to_string(), &format!("dispatch-split-{}", crate::gpu::dxil::kernel::dispatch_piece_limit()))
             } else { id };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
-            if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
+            let id = if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
             } else {
                 id
-            }
+            };
+            with_emit_switches(id, |name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned()))
         })
+    }
+
+    /// `id` for a recompiler that runs with the switches `get` returns. The switches the HLSL
+    /// emitter reads (`XCL_SAFE_BARRIER=0`, `XCL_WAVE64_SPIN=0`, `XCL_X64_ALL_MASKS`,
+    /// `XCL_RECOMP_NO_STRUCTURED`) change the translation of the same bytes: without this a run
+    /// with one of them set loaded what an earlier run without it had cached. Their defaults
+    /// leave `id` as it is, so existing entries stay valid.
+    pub(super) fn with_emit_switches(id: u64, get: impl Fn(&str) -> Option<String>) -> u64 {
+        let off = |name: &str| get(name).is_some_and(|v| v.trim() == "0");
+        let mut tag = String::new();
+        for (set, part) in [
+            (off("XCL_SAFE_BARRIER"), "safe-barrier-0;"),
+            (off("XCL_WAVE64_SPIN"), "wave64-spin-0;"),
+            (get("XCL_X64_ALL_MASKS").is_some(), "x64-all-masks;"),
+            (get("XCL_RECOMP_NO_STRUCTURED").is_some(), "no-structured;"),
+        ] {
+            if set {
+                tag.push_str(part);
+            }
+        }
+        if id == 0 || tag.is_empty() { id } else { identity_for(&id.to_string(), &tag) }
     }
 
     /// a second hash of the bytes, independent of `fnv64`'s
@@ -1506,6 +1528,35 @@ mod shader_cache_tests {
         ];
         assert!(ids.iter().all(|&i| i != 0));
         assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), ids.len());
+    }
+
+    /// A recompiler switch that changes the emitted HLSL gives the cache another identity, so a
+    /// run with `XCL_SAFE_BARRIER=0` does not load the spin-barrier translation an earlier run
+    /// stored; the switches' defaults keep the identity (and the existing entries).
+    #[test]
+    fn emit_switches_change_the_translated_identity() {
+        use translated::{identity_for, with_emit_switches};
+        let base = identity_for("s", "t");
+        let with = |vars: &[(&str, &str)]| {
+            let vars: Vec<(String, String)> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            with_emit_switches(base, move |name| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()))
+        };
+        assert_eq!(with(&[]), base);
+        assert_eq!(with(&[("XCL_SAFE_BARRIER", "1"), ("XCL_WAVE64_SPIN", "1")]), base, "defaults written out");
+        let ids = [
+            base,
+            with(&[("XCL_SAFE_BARRIER", "0")]),
+            with(&[("XCL_SAFE_BARRIER", " 0 ")]),
+            with(&[("XCL_WAVE64_SPIN", "0")]),
+            with(&[("XCL_X64_ALL_MASKS", "1")]),
+            with(&[("XCL_RECOMP_NO_STRUCTURED", "")]),
+            with(&[("XCL_SAFE_BARRIER", "0"), ("XCL_WAVE64_SPIN", "0")]),
+        ];
+        assert_eq!(ids[1], ids[2], "the emitter trims the value too");
+        let distinct: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len() - 1);
+        assert!(ids.iter().all(|&i| i != 0));
+        assert_eq!(with_emit_switches(0, |_| Some("0".into())), 0, "a disabled cache stays disabled");
     }
 
     /// An edit of the direct translator's sources changes the direct entries' identity (no
