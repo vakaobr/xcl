@@ -907,6 +907,23 @@ fn can_reserve(support2: i32, samples: u32, tiled_msaa_levels: u32) -> bool {
     support2 & D3D12_FORMAT_SUPPORT2_TILED.0 != 0 && (samples <= 1 || tiled_msaa_levels > 0)
 }
 
+/// On D3DMetal, a texture written by a copy and read through another reserved texture on the same
+/// tiles reads scrambled bytes unless it is block-compressed or allows unordered access (measured
+/// with copies and shader reads; the texture's own compression state, kept per texture and not
+/// per tile, is the likely reason). The flags a shared-page texture of `format` needs there, or
+/// None when it can have neither (`support1`: the format's D3D12_FORMAT_SUPPORT1).
+fn native_page_flags(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, support1: i32) -> Option<D3D12_RESOURCE_FLAGS> {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC1_TYPELESS, DXGI_FORMAT_BC5_SNORM, DXGI_FORMAT_BC6H_TYPELESS, DXGI_FORMAT_BC7_UNORM_SRGB};
+    let block_compressed = (DXGI_FORMAT_BC1_TYPELESS.0..=DXGI_FORMAT_BC5_SNORM.0).contains(&format.0) || (DXGI_FORMAT_BC6H_TYPELESS.0..=DXGI_FORMAT_BC7_UNORM_SRGB.0).contains(&format.0);
+    if block_compressed {
+        Some(D3D12_RESOURCE_FLAG_NONE)
+    } else if support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0 {
+        Some(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+    } else {
+        None
+    }
+}
+
 /// Whether the device can make `desc` a reserved texture, asked before CreateReservedResource:
 /// refused, it is an error in the debug layer (#940: R32G8X24_TYPELESS depth, 1 and 4 samples).
 /// A query that fails says yes, and creation decides.
@@ -914,6 +931,11 @@ unsafe fn reservable(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> bool {
     let mut f = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: desc.Format, ..Default::default() };
     if dev.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &mut f as *mut _ as *mut c_void, std::mem::size_of_val(&f) as u32).is_err() {
         return true;
+    }
+    // D3DMetal reports TILED for no format but makes reserved textures of them; they share
+    // pages only as block-compressed formats or with unordered access (`native_page_flags`)
+    if crate::util::mac_host() {
+        return desc.SampleDesc.Count <= 1 && native_page_flags(desc.Format, f.Support1.0).is_some();
     }
     // a format without TILED is not reservable whatever the sample count's query says
     if !can_reserve(f.Support2.0, 1, 0) {
@@ -968,7 +990,16 @@ unsafe fn place_on_pages(
         return None;
     }
     // reserved textures have the PC's 64 KiB tiles
-    let tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..*desc };
+    let mut tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..*desc };
+    if crate::util::mac_host() {
+        // render and depth targets: their sharing was not probed on D3DMetal, they keep arenas
+        if require_aligned || desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0) != 0 {
+            return None;
+        }
+        let mut f = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: desc.Format, ..Default::default() };
+        let support1 = if dev.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &mut f as *mut _ as *mut c_void, std::mem::size_of_val(&f) as u32).is_ok() { f.Support1.0 } else { 0 };
+        tiled.Flags.0 |= native_page_flags(desc.Format, support1)?.0;
+    }
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let log = |why: &str| {
         if require_aligned && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
@@ -1883,6 +1914,128 @@ mod tests {
                 let mut r: Option<ID3D12Resource> = None;
                 let made = dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).is_ok() && r.is_some();
                 assert_eq!(reservable(&dev, &desc), made, "format {} x{samples}: reservable vs CreateReservedResource", format.0);
+            }
+        }
+    }
+
+    /// Two sampled textures placed at one address are on its shared pages, and what a copy writes
+    /// through one the other reads back in every slice and level (packed ones too), RGBA8 and BC7.
+    /// On a Mac neither was placed (D3DMetal reports TILED for no format), and there an RGBA8
+    /// texture without unordered access reads another's writes scrambled. Needs a hardware adapter
+    /// (skips on WARP).
+    #[test]
+    fn sampled_textures_at_one_address_share_their_pages_in_every_slice() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::gpu::recomp::runner::skip_test;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return skip_test("no GPU") };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return skip_test("no GPU");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return skip_test("no GPU") };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let sample = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+            let buffer = |bytes: u64| D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: sample, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+            let barrier = |r: &ID3D12Resource, from: D3D12_RESOURCE_STATES, to: D3D12_RESOURCE_STATES| {
+                let t = D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(r), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, StateBefore: from, StateAfter: to };
+                D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(t) }, ..Default::default() }
+            };
+            let run = |record: &dyn Fn(&ID3D12GraphicsCommandList)| {
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                record(&list);
+                list.Close().unwrap();
+                before_execute(&queue);
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                crate::gpu::texture::wait(&dev, &queue).unwrap();
+            };
+
+            // 256x256, 4 slices, 9 levels: standard and packed levels in each slice
+            for (k, format) in [DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_BC7_UNORM].into_iter().enumerate() {
+                let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 256, Height: 256, DepthOrArraySize: 4, MipLevels: 9, Format: format, SampleDesc: sample, ..Default::default() };
+                // (an adapter that makes no reserved array with packed levels does not run the path)
+                let mut r: Option<ID3D12Resource> = None;
+                if dev.CreateReservedResource(&D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..desc }, D3D12_RESOURCE_STATE_COMMON, None, &mut r).is_err() || r.is_none() {
+                    return skip_test("no reserved array with packed levels");
+                }
+                let va = 0x60_0000_0000 + k * 64 * MIB;
+                let place_at = || {
+                    let mut p = std::ptr::null_mut();
+                    let hr = place_pages(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), None, riid, &mut p);
+                    assert!(hr.is_some_and(|hr| hr >= 0) && !p.is_null(), "format {}: not placed on the pages at {va:#x}", format.0);
+                    assert!(is_placed_texture(p as usize));
+                    ID3D12Resource::from_raw(p)
+                };
+                let (a, b) = (place_at(), place_at());
+                let subs = 9 * 4;
+                let placed = a.GetDesc();
+                let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subs];
+                let (mut rows, mut row_bytes, mut total) = (vec![0u32; subs], vec![0u64; subs], 0u64);
+                dev.GetCopyableFootprints(&placed, 0, subs as u32, 0, Some(layouts.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), Some(&mut total));
+                let row = |s: usize, y: usize| layouts[s].Offset as usize + y * layouts[s].Footprint.RowPitch as usize;
+                let want = |s: usize, y: usize, x: usize| (s * 37 + y * 11 + x * 13 + k) as u8;
+
+                let (mut upload, mut readback): (Option<ID3D12Resource>, Option<ID3D12Resource>) = (None, None);
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buffer(total), D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut upload).unwrap();
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buffer(total), D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback).unwrap();
+                let (upload, readback) = (upload.unwrap(), readback.unwrap());
+                let mut p = std::ptr::null_mut();
+                upload.Map(0, None, Some(&mut p)).unwrap();
+                let bytes = std::slice::from_raw_parts_mut(p as *mut u8, total as usize);
+                for s in 0..subs {
+                    for y in 0..rows[s] as usize {
+                        for x in 0..row_bytes[s] as usize {
+                            bytes[row(s, y) + x] = want(s, y, x);
+                        }
+                    }
+                }
+                upload.Unmap(0, None);
+                let copy = |list: &ID3D12GraphicsCommandList, buf: &ID3D12Resource, tex: &ID3D12Resource, to_texture: bool| {
+                    for (s, layout) in layouts.iter().enumerate() {
+                        let footprint = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(buf), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *layout } };
+                        let sub = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(tex), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: s as u32 } };
+                        if to_texture {
+                            list.CopyTextureRegion(&sub, 0, 0, 0, &footprint, None);
+                        } else {
+                            list.CopyTextureRegion(&footprint, 0, 0, 0, &sub, None);
+                        }
+                    }
+                };
+                // written through `a` ...
+                run(&|list| {
+                    list.ResourceBarrier(&[barrier(&a, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    copy(list, &upload, &a, true);
+                    list.ResourceBarrier(&[barrier(&a, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+                });
+                // ... read through `b`
+                run(&|list| {
+                    let alias = D3D12_RESOURCE_ALIASING_BARRIER { pResourceBefore: std::mem::ManuallyDrop::new(None), pResourceAfter: std::mem::ManuallyDrop::new(None) };
+                    let alias = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING, Anonymous: D3D12_RESOURCE_BARRIER_0 { Aliasing: std::mem::ManuallyDrop::new(alias) }, ..Default::default() };
+                    list.ResourceBarrier(&[alias, barrier(&b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    copy(list, &readback, &b, false);
+                    list.ResourceBarrier(&[barrier(&b, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+                });
+                let mut p = std::ptr::null_mut();
+                readback.Map(0, None, Some(&mut p)).unwrap();
+                let bytes = std::slice::from_raw_parts(p as *const u8, total as usize);
+                let mut wrong = Vec::new();
+                for s in 0..subs {
+                    let bad = (0..rows[s] as usize).flat_map(|y| (0..row_bytes[s] as usize).map(move |x| (y, x))).filter(|&(y, x)| bytes[row(s, y) + x] != want(s, y, x)).count();
+                    if bad > 0 {
+                        wrong.push(format!("slice {} level {}: {bad} bytes", s / 9, s % 9));
+                    }
+                }
+                readback.Unmap(0, None);
+                assert!(wrong.is_empty(), "format {}: read through the other texture: {}", format.0, wrong.join(", "));
+                drop((a, b));
             }
         }
     }
