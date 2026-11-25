@@ -132,6 +132,36 @@ pub fn under_wine() -> bool {
     })
 }
 
+/// The process runs under Wine on a Mac (ntdll's `wine_get_host_version` says Darwin): CrossOver
+/// or the Game Porting Toolkit, where D3D12 is Apple's D3DMetal and, on Apple Silicon, the
+/// title's code runs through Rosetta 2. Known from the start of the run, before there is a
+/// device. `XCL_MAC_HOST=1` / `0` overrides the detection.
+pub fn mac_host() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    static MAC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MAC.get_or_init(|| {
+        let forced = std::env::var("XCL_MAC_HOST").ok();
+        // SAFETY: ntdll is always loaded; Wine's export fills two pointers to static strings.
+        let sysname = unsafe {
+            GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_host_version".as_ptr() as *const u8).and_then(|f| {
+                let f: unsafe extern "C" fn(*mut *const u8, *mut *const u8) = std::mem::transmute(f);
+                let (mut sysname, mut release) = (std::ptr::null(), std::ptr::null());
+                f(&mut sysname, &mut release);
+                from_cstr_ptr(sysname)
+            })
+        };
+        mac_host_from(forced.as_deref(), sysname.as_deref())
+    })
+}
+
+/// `mac_host`'s answer from `XCL_MAC_HOST` (`forced`) and the host's system name, if Wine gave one.
+fn mac_host_from(forced: Option<&str>, sysname: Option<&str>) -> bool {
+    match forced {
+        Some(v) => v.trim() != "0",
+        None => sysname.is_some_and(|s| s.eq_ignore_ascii_case("Darwin")),
+    }
+}
+
 /// Normalised DLL key: lower-case file name, ".dll" appended when no extension.
 pub fn dll_key(name: &str) -> String {
     let base = name.rsplit(['\\', '/']).next().unwrap_or(name);
@@ -320,6 +350,20 @@ unsafe impl Sync for SendPtr {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Darwin from Wine's host version is a Mac (in any case); Linux, Windows and no answer are
+    /// not; `XCL_MAC_HOST` decides when it is set, "0" for no and anything else for yes.
+    #[test]
+    fn a_mac_host_is_darwin_under_wine_unless_forced() {
+        assert!(mac_host_from(None, Some("Darwin")));
+        assert!(mac_host_from(None, Some("darwin")));
+        assert!(!mac_host_from(None, Some("Linux")));
+        assert!(!mac_host_from(None, None));
+        assert!(!mac_host_from(Some("0"), Some("Darwin")));
+        assert!(!mac_host_from(Some(" 0 "), Some("Darwin")));
+        assert!(mac_host_from(Some("1"), None));
+        assert!(mac_host_from(Some("1"), Some("Linux")));
+    }
 
     #[test]
     fn dll_keys() {
