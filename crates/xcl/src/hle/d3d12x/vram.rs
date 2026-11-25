@@ -318,11 +318,16 @@ impl Pages {
             let counts: Vec<u32> = ranges.iter().map(|r| r.2).collect();
             let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
             let region = D3D12_TILE_REGION_SIZE { NumTiles: tiles.len() as u32, UseBox: false.into(), ..Default::default() };
+            // one region from coordinate 0, or on a native host one per subresource
+            let (coords, regions) = match crate::util::mac_host().then(|| subresource_regions(res, tiles.len() as u32)).flatten() {
+                Some(r) => r,
+                None => (vec![coord], vec![region]),
+            };
             self.queue.UpdateTileMappings(
                 res,
-                1,
-                Some(&coord),
-                Some(&region),
+                coords.len() as u32,
+                Some(coords.as_ptr()),
+                Some(regions.as_ptr()),
                 &self.pools[h as usize],
                 ranges.len() as u32,
                 Some(flags.as_ptr()),
@@ -444,6 +449,67 @@ impl Pages {
     }
 }
 
+/// The tile regions of `res` in overall tile order, one per subresource and one per slice's packed
+/// mips, covering its first `num_tiles` tiles. D3DMetal maps an array's tiles walked as one
+/// region from coordinate 0 only into the first half of its slices (the others read zero, through
+/// the texture itself); a region per subresource reaches all of them. None: the subresources'
+/// tiles do not line up with the overall order this assumes, and the caller keeps one region.
+unsafe fn subresource_regions(res: &ID3D12Resource, num_tiles: u32) -> Option<(Vec<D3D12_TILED_RESOURCE_COORDINATE>, Vec<D3D12_TILE_REGION_SIZE>)> {
+    let mut dev: Option<ID3D12Device> = None;
+    res.GetDevice(&mut dev).ok()?;
+    let dev = dev?;
+    let desc = res.GetDesc();
+    let mips = desc.MipLevels.max(1) as u32;
+    let slices = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { desc.DepthOrArraySize.max(1) as u32 };
+    let (mut total, mut packed, mut shape) = (0u32, D3D12_PACKED_MIP_INFO::default(), D3D12_TILE_SHAPE::default());
+    let mut count = mips * slices;
+    let mut subs = vec![D3D12_SUBRESOURCE_TILING::default(); count as usize];
+    dev.GetResourceTiling(res, Some(&mut total), Some(&mut packed), Some(&mut shape), Some(&mut count), 0, subs.as_mut_ptr());
+    subs.truncate(count as usize);
+    let mut parts: Vec<(u32, u32, u32)> = Vec::new(); // (first overall tile, subresource, tiles)
+    for (sub, t) in subs.iter().enumerate() {
+        let n = t.WidthInTiles * t.HeightInTiles as u32 * t.DepthInTiles as u32;
+        if t.StartTileIndexInOverallResource != D3D12_PACKED_TILE && n > 0 {
+            parts.push((t.StartTileIndexInOverallResource, sub as u32, n));
+        }
+    }
+    parts.sort_unstable();
+    // what lies between them is the packed mips, one slice's after another
+    let (mut out, mut next, mut slice) = (Vec::new(), 0u32, 0u32);
+    let mut packed_until = |end: u32, out: &mut Vec<(u32, u32)>, next: &mut u32, slice: &mut u32| -> Option<()> {
+        while *next < end {
+            if packed.NumPackedMips == 0 || packed.NumTilesForPackedMips == 0 || *slice >= slices || *next + packed.NumTilesForPackedMips > end {
+                return None;
+            }
+            out.push((*slice * mips + packed.NumStandardMips as u32, packed.NumTilesForPackedMips));
+            *next += packed.NumTilesForPackedMips;
+            *slice += 1;
+        }
+        (*next == end).then_some(())
+    };
+    for &(first, sub, n) in &parts {
+        packed_until(first, &mut out, &mut next, &mut slice)?;
+        out.push((sub, n));
+        next += n;
+    }
+    packed_until(total, &mut out, &mut next, &mut slice)?;
+    if packed.NumPackedMips > 0 && slice != slices {
+        return None;
+    }
+    // only as far as the tiles this call maps (`heap_ranges_trimmed`)
+    let (mut coords, mut regions, mut left) = (Vec::new(), Vec::new(), num_tiles);
+    for (sub, n) in out {
+        if left == 0 {
+            break;
+        }
+        let n = n.min(left);
+        left -= n;
+        coords.push(D3D12_TILED_RESOURCE_COORDINATE { Subresource: sub, ..Default::default() });
+        regions.push(D3D12_TILE_REGION_SIZE { NumTiles: n, UseBox: false.into(), ..Default::default() });
+    }
+    (left == 0).then_some((coords, regions))
+}
+
 /// The ranges of one UpdateTileMappings call for pool heap `heap` over a resource whose overall
 /// tile i goes to `tiles[i]`: (mapped, tile offset in the heap, count) – runs of consecutive
 /// tiles of the heap, and skipped runs for tiles of other heaps.
@@ -482,6 +548,23 @@ fn can_reserve(support2: i32, samples: u32, tiled_msaa_levels: u32) -> bool {
     support2 & D3D12_FORMAT_SUPPORT2_TILED.0 != 0 && (samples <= 1 || tiled_msaa_levels > 0)
 }
 
+/// On D3DMetal, a texture written by a copy and read through another reserved texture on the same
+/// tiles reads scrambled bytes unless it is block-compressed or allows unordered access (measured
+/// with copies and shader reads; the texture's own compression state, kept per texture and not
+/// per tile, is the likely reason). The flags a shared-page texture of `format` needs there, or
+/// None when it can have neither (`support1`: the format's D3D12_FORMAT_SUPPORT1).
+fn native_page_flags(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, support1: i32) -> Option<D3D12_RESOURCE_FLAGS> {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC1_TYPELESS, DXGI_FORMAT_BC5_SNORM, DXGI_FORMAT_BC6H_TYPELESS, DXGI_FORMAT_BC7_UNORM_SRGB};
+    let block_compressed = (DXGI_FORMAT_BC1_TYPELESS.0..=DXGI_FORMAT_BC5_SNORM.0).contains(&format.0) || (DXGI_FORMAT_BC6H_TYPELESS.0..=DXGI_FORMAT_BC7_UNORM_SRGB.0).contains(&format.0);
+    if block_compressed {
+        Some(D3D12_RESOURCE_FLAG_NONE)
+    } else if support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0 {
+        Some(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+    } else {
+        None
+    }
+}
+
 /// Whether the device can make `desc` a reserved texture, asked before CreateReservedResource:
 /// refused, it is an error in the debug layer (#940: R32G8X24_TYPELESS depth, 1 and 4 samples).
 /// A query that fails says yes, and creation decides.
@@ -489,6 +572,11 @@ unsafe fn reservable(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> bool {
     let mut f = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: desc.Format, ..Default::default() };
     if dev.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &mut f as *mut _ as *mut c_void, std::mem::size_of_val(&f) as u32).is_err() {
         return true;
+    }
+    // D3DMetal reports TILED for no format but makes reserved textures of them; they share
+    // pages only as block-compressed formats or with unordered access (`native_page_flags`)
+    if crate::util::mac_host() {
+        return desc.SampleDesc.Count <= 1 && native_page_flags(desc.Format, f.Support1.0).is_some();
     }
     // a format without TILED is not reservable whatever the sample count's query says
     if !can_reserve(f.Support2.0, 1, 0) {
@@ -525,7 +613,16 @@ unsafe fn place_on_pages(
         return None;
     }
     // reserved textures have the PC's 64 KiB tiles
-    let tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..*desc };
+    let mut tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..*desc };
+    if crate::util::mac_host() {
+        // render and depth targets: their sharing was not probed on D3DMetal, they keep arenas
+        if require_aligned || desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0) != 0 {
+            return None;
+        }
+        let mut f = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: desc.Format, ..Default::default() };
+        let support1 = if dev.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &mut f as *mut _ as *mut c_void, std::mem::size_of_val(&f) as u32).is_ok() { f.Support1.0 } else { 0 };
+        tiled.Flags.0 |= native_page_flags(desc.Format, support1)?.0;
+    }
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let log = |why: &str| {
         if require_aligned && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
