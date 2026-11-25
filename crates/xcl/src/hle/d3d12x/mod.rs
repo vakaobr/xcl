@@ -20,6 +20,7 @@ pub mod dred;
 mod fence_x;
 pub mod frame;
 pub mod guard;
+mod guarded_copy;
 mod late_release;
 pub mod layout;
 mod level_tiles;
