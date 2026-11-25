@@ -7303,6 +7303,22 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             }
             hr as u32 as usize
         }
+        // a host without GPU timestamps: the clock XCL's timestamps are read from
+        16 if super::cpu_writes::cpu_clock() => {
+            if a1 != 0 {
+                (a1 as *mut u64).write_unaligned(super::cpu_writes::clock_frequency());
+            }
+            0
+        }
+        17 if super::cpu_writes::cpu_clock() => {
+            let now = super::cpu_writes::clock_now();
+            for p in [a1, a2] {
+                if p != 0 {
+                    (p as *mut u64).write_unaligned(now);
+                }
+            }
+            0
+        }
         16 => {
             let f: unsafe extern "system" fn(*mut c_void, usize) -> i32 = std::mem::transmute(pc(PC_TIMESTAMP_FREQUENCY));
             f(this, a1) as u32 as usize

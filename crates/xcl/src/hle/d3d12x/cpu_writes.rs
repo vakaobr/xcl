@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 
 use windows::core::Interface;
@@ -28,6 +28,52 @@ pub(super) enum Write {
     /// (`src`), copied atomically to `va` once the queue's fence completes. Holding `_buf` keeps
     /// the mapping alive until the worker finishes.
     ReadbackU64 { va: usize, src: usize, _buf: ID3D12Resource },
+}
+
+/// The host has no GPU timestamps, so XCL's timestamps are the CPU's clock
+/// (`QueryPerformanceCounter`, with its frequency as the queue's timestamp frequency).
+/// Apple's D3DMetal (macOS under CrossOver) is such a host: `GetTimestampFrequency` gives 60
+/// and every `D3D12_QUERY_TYPE_TIMESTAMP` resolves to 0, so a title that waits for a GPU
+/// timestamp, or times its frames with them, read 0 for ever.
+static CPU_CLOCK: AtomicBool = AtomicBool::new(false);
+
+/// Below this many ticks a second a queue's timestamp frequency is not a GPU clock's (PC GPUs:
+/// MHz and up).
+const SLOWEST_GPU_CLOCK: u64 = 1000;
+
+/// Whether timestamps are the CPU's clock on this host.
+pub(super) fn cpu_clock() -> bool {
+    CPU_CLOCK.load(Ordering::Acquire)
+}
+
+/// Whether a queue that answers `GetTimestampFrequency` with `frequency` has no GPU clock.
+fn no_gpu_clock(frequency: u64) -> bool {
+    frequency < SLOWEST_GPU_CLOCK
+}
+
+fn use_cpu_clock(why: std::fmt::Arguments) {
+    if !CPU_CLOCK.swap(true, Ordering::AcqRel) {
+        crate::xlog_info!("D3D12.X: no GPU timestamps on this host ({why}) – a timestamp is the CPU's clock when it was recorded, written when the GPU gets there");
+    }
+}
+
+/// A title queue's own `GetTimestampFrequency` answer, asked when the queue was created.
+pub(super) fn note_host_timestamp_frequency(frequency: u64) {
+    if no_gpu_clock(frequency) {
+        use_cpu_clock(format_args!("the queue's timestamp frequency is {frequency}"));
+    }
+}
+
+/// The CPU clock's ticks now.
+pub(super) fn clock_now() -> u64 {
+    super::frame::qpc() as u64
+}
+
+/// The CPU clock's ticks a second.
+pub(super) fn clock_frequency() -> u64 {
+    let mut f = 0i64;
+    unsafe { windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut f) };
+    f as u64
 }
 
 struct Job {
@@ -74,7 +120,13 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                     match w {
                         Write::Immediate(va, words) => write_now(*va, words),
                         Write::ReadbackU64 { va, src, .. } => {
-                            let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
+                            let mut value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
+                            if value == 0 && job.fence.GetCompletedValue() >= job.value {
+                                // the queue is done and the query resolved to nothing (a queue
+                                // that never got there says nothing about the host)
+                                use_cpu_clock(format_args!("a timestamp query resolved to 0"));
+                                value = clock_now();
+                            }
                             write_u64_now(*va, value);
                         }
                     }
@@ -217,6 +269,19 @@ mod tests {
             }
             assert_eq!(*cell, [7, 9]);
         }
+    }
+
+    /// Only an answer no GPU clock gives turns the CPU's clock on.
+    #[test]
+    fn a_60_hz_timestamp_frequency_is_no_gpu_clock() {
+        assert!(no_gpu_clock(0));
+        assert!(no_gpu_clock(60)); // Apple's D3DMetal
+        assert!(!no_gpu_clock(1_000_000));
+        assert!(!no_gpu_clock(25_000_000));
+        assert!(!no_gpu_clock(1_000_000_000));
+        assert!(!no_gpu_clock(clock_frequency()));
+        let a = clock_now();
+        assert!(a != 0 && a <= clock_now());
     }
 
     /// A ReadbackU64 write copies the 64-bit value from the mapped readback buffer after the queue finishes.

@@ -2509,7 +2509,7 @@ unsafe fn ensure_timestamp_readback(dev: &ID3D12Device, pool: &mut TimestampPool
 }
 
 /// The GPU timestamp (the PC queue's ticks) written at `va` when the work before it is done.
-unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
+unsafe fn timestamp(list: *mut c_void, va: u64, mode: D3D12_WRITEBUFFERIMMEDIATE_MODE, what: &str) {
     static N: AtomicU64 = AtomicU64::new(0);
     let ty = list_type(list);
     if ty != D3D12_COMMAND_LIST_TYPE_DIRECT && ty != D3D12_COMMAND_LIST_TYPE_COMPUTE {
@@ -2521,6 +2521,11 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
     let uma_dst = real::uma_window_buffer(va as usize, 8);
     if uma_dst.is_none() && !super::cpu_writes::writable(va as usize, 8) {
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
+    }
+    if super::cpu_writes::cpu_clock() {
+        // no GPU timestamps on this host: the CPU's clock now, written as any other value is
+        let now = super::cpu_writes::clock_now();
+        return write(list, va, &[now as u32, (now >> 32) as u32], mode, what);
     }
     let Some(dev) = device_of(list) else { return };
     let (heap, readback) = {
@@ -2582,7 +2587,7 @@ pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64
     const W: &str = "Write64BitValueBottomOfPipeX";
     record_write_trace(this, va, value, flags, "W64B");
     if flags & BOTTOM_TIMESTAMPS != 0 {
-        return timestamp(this, va, W);
+        return timestamp(this, va, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, W);
     }
     note_write64_recorded(this, va, value);
     write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, W);
@@ -3047,7 +3052,7 @@ pub(super) unsafe extern "system" fn write64_top_x(this: *mut c_void, va: u64, v
     const W: &str = "Write64BitValueTopOfPipeX";
     record_write_trace(this, va, value, flags, "W64T");
     if flags & TOP_TIMESTAMPS != 0 {
-        return timestamp(this, va, W);
+        return timestamp(this, va, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, W);
     }
     note_write64_recorded(this, va, value);
     write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, W);

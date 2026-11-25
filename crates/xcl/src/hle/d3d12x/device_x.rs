@@ -79,6 +79,15 @@ pub(super) unsafe extern "system" fn create_command_queue_x(this: *mut c_void, d
     let hr = real::dev_create_command_queue(this, d.as_ptr() as usize, riid, ppv);
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         super::list_x::on_queue_create(*ppv as usize, this as usize, D3D12_COMMAND_LIST_TYPE(d[0] as i32));
+        // a queue that takes timestamps says here whether the host has a GPU clock
+        if d[0] as i32 == D3D12_COMMAND_LIST_TYPE_DIRECT.0 || d[0] as i32 == D3D12_COMMAND_LIST_TYPE_COMPUTE.0 {
+            const PC_TIMESTAMP_FREQUENCY: usize = 16;
+            let f: unsafe extern "system" fn(*mut c_void, *mut u64) -> HRESULT = std::mem::transmute(real::orig_fn(*ppv, PC_TIMESTAMP_FREQUENCY));
+            let mut frequency = 0u64;
+            if f(*ppv, &mut frequency) >= 0 {
+                super::cpu_writes::note_host_timestamp_frequency(frequency);
+            }
+        }
     }
     hr
 }
