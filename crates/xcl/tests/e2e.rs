@@ -64,6 +64,42 @@ impl Drop for TempDir {
     }
 }
 
+/// `CARGO_TARGET_TMPDIR` as this process can use it. Built under Wine (macOS, Linux) it is the
+/// host's path, `/…`, which Windows reads as a folder of the current drive (`/Users/…` from a
+/// shell in the home folder is `Y:\Users\…`, the home folder's own `Users`): the test's files
+/// land outside the target directory, and the drives XCL mounts from that path (`S:` for
+/// persistent local storage) do not resolve. Wine's `wine_get_dos_file_name` gives its drive path.
+fn target_tmpdir() -> PathBuf {
+    let tmp = env!("CARGO_TARGET_TMPDIR");
+    if tmp.starts_with('/') {
+        if let Some(dos) = wine_dos_path(tmp) {
+            return dos;
+        }
+    }
+    PathBuf::from(tmp)
+}
+
+/// Wine's DOS path for the host path `unix` (None on Windows, where kernel32 has no such export).
+fn wine_dos_path(unix: &str) -> Option<PathBuf> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
+    let unix = std::ffi::CString::new(unix).ok()?;
+    // SAFETY: kernel32 is loaded and both names are NUL-terminated; Wine's export takes a
+    // NUL-terminated host path and returns a NUL-terminated wide string from the process heap.
+    unsafe {
+        let f = GetProcAddress(GetModuleHandleA(c"kernel32.dll".as_ptr() as *const u8), c"wine_get_dos_file_name".as_ptr() as *const u8)?;
+        let f: unsafe extern "system" fn(*const std::ffi::c_char) -> *mut u16 = std::mem::transmute(f);
+        let w = f(unix.as_ptr());
+        if w.is_null() {
+            return None;
+        }
+        let len = (0..).take_while(|&i| *w.add(i) != 0).count();
+        let dos = String::from_utf16_lossy(std::slice::from_raw_parts(w, len));
+        HeapFree(GetProcessHeap(), 0, w as *const std::ffi::c_void);
+        Some(PathBuf::from(dos))
+    }
+}
+
 fn temp_dir(prefix: &str) -> TempDir {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -71,8 +107,7 @@ fn temp_dir(prefix: &str) -> TempDir {
         .unwrap()
         .as_nanos();
     let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("{prefix}-{}-{nanos}-{seq}", std::process::id()));
+    let path = target_tmpdir().join(format!("{prefix}-{}-{nanos}-{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).unwrap();
     TempDir(path)
