@@ -110,6 +110,12 @@ pub fn classify(blob: &[u8]) -> (Kind, Vec<Part>) {
     (Kind::Unknown, Vec::new())
 }
 
+/// Whether a PC D3D12 driver can take the blob as a shader: DXIL or SM5 byte code. Windows
+/// drivers refuse anything else, but Apple's D3DMetal crashes on a container it does not know.
+pub fn runs_on_pc(blob: &[u8]) -> bool {
+    matches!(classify(blob).0, Kind::Dxil | Kind::Dxbc)
+}
+
 /// Disassembly of every plausible RDNA2 program in the blob's unknown regions.
 pub fn rdna2_listing(blob: &[u8]) -> String {
     if let Some(sh) = xbox::parse(blob) {
@@ -468,6 +474,17 @@ mod tests {
         assert_eq!(classify(&code).0, Kind::Rdna2Raw);
         assert_eq!(classify(b"\x7fELF....").0, Kind::Elf);
         assert_eq!(classify(b"random junk!").0, Kind::Unknown);
+    }
+
+    #[test]
+    fn only_pc_shaders_run_on_pc() {
+        assert!(runs_on_pc(&container(&[(b"ISG1", b"x"), (b"DXIL", b"bitcode")])));
+        assert!(runs_on_pc(&container(&[(b"SHEX", b"code")])));
+        // the test title's console container: a DXBC header around a console part with RDNA2 code
+        let code = [0x01u8, 0x03, 0x80, 0xbe, 0x00, 0x00, 0x81, 0xbf];
+        assert!(!runs_on_pc(&container(&[(b"XBOX", &code)])));
+        assert!(!runs_on_pc(&code));
+        assert!(!runs_on_pc(b"\x7fELF...."));
     }
 
     #[test]
