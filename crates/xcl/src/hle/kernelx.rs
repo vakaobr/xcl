@@ -784,17 +784,36 @@ pub struct TitleMemoryStatusT {
     pub title_page_table_used: u64,
 }
 
-fn process_private_bytes() -> u64 {
+/// The process's private commit: PrivateUsage on Windows. Wine's K32GetProcessMemoryInfo
+/// leaves PrivateUsage 0, and its PagefileUsage is not the commit (on macOS it is the Mach
+/// task's virtual size, ~42 GB that a commit does not change), so there the committed
+/// private regions are summed with VirtualQuery instead.
+pub(crate) fn process_private_bytes() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
     unsafe {
         let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
         c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-        if K32GetProcessMemoryInfo(thr::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb) != 0 {
-            // Wine fills the fields before PrivateUsage only; PagefileUsage is the same number
-            // on Windows (the commit charge)
-            if c.PrivateUsage != 0 { c.PrivateUsage as u64 } else { c.PagefileUsage as u64 }
-        } else {
-            0
+        if K32GetProcessMemoryInfo(thr::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb) != 0 && c.PrivateUsage != 0 {
+            return c.PrivateUsage as u64;
+        }
+    }
+    committed_private_bytes()
+}
+
+/// The sum of the MEM_COMMIT + MEM_PRIVATE regions of the address space.
+fn committed_private_bytes() -> u64 {
+    let (mut sum, mut addr) = (0u64, 0usize);
+    loop {
+        let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { mem::VirtualQuery(addr as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+            return sum;
+        }
+        if m.State == mem::MEM_COMMIT && m.Type == mem::MEM_PRIVATE {
+            sum += m.RegionSize as u64;
+        }
+        match (m.BaseAddress as usize).checked_add(m.RegionSize) {
+            Some(next) if next > addr => addr = next,
+            _ => return sum,
         }
     }
 }
@@ -2754,10 +2773,26 @@ mod tests {
         assert_eq!(unsafe { TitleMemoryStatus(&mut s) }, 1);
         assert_eq!(s.total, 13_824 * 1024 * 1024);
         assert!(s.avail <= s.total);
-        // the process's own memory counts as used (Wine leaves PrivateUsage 0)
+        // the process's own memory counts as used (Wine leaves PrivateUsage 0: VirtualQuery sum)
         assert!(process_private_bytes() > 0 && s.avail < s.total);
         s.dw_length = 8;
         assert_eq!(unsafe { TitleMemoryStatus(&mut s) }, 0);
+    }
+
+    /// A 256 MB commit shows in the process's commit, by the counter and by the VirtualQuery
+    /// sum Wine falls back to (Wine's PrivateUsage is 0 and its PagefileUsage does not move).
+    #[test]
+    fn process_private_bytes_counts_a_commit() {
+        let size = 256usize << 20;
+        let (before, regions_before) = (process_private_bytes(), committed_private_bytes());
+        let p = unsafe { mem::VirtualAlloc(std::ptr::null(), size, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) };
+        assert!(!p.is_null());
+        let (after, regions_after) = (process_private_bytes(), committed_private_bytes());
+        unsafe { mem::VirtualFree(p, 0, mem::MEM_RELEASE) };
+        // other tests run in this process: allow them to free up to 64 MB meanwhile
+        let min = (size as u64) - (64 << 20);
+        assert!(after.saturating_sub(before) >= min, "commit {before} -> {after}");
+        assert!(regions_after.saturating_sub(regions_before) >= min, "regions {regions_before} -> {regions_after}");
     }
 
     #[test]
