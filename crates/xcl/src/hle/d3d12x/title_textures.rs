@@ -2523,7 +2523,7 @@ mod tests {
                 println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: no UMA");
                 return;
             };
-            if !super::super::vram::on_pages() {
+            if !super::super::vram::sampled_on_pages() {
                 println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: title textures are not on shared pages on this host (XCL_VRAM_ARENAS)");
                 return;
             }

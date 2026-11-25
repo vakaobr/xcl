@@ -778,6 +778,18 @@ pub(super) fn on_pages() -> bool {
     })
 }
 
+/// Whether sampled title textures (`place_pages`) are tried on shared pages: `XCL_VRAM_ARENAS=1`
+/// – never, `=0` – always; unset: as `on_pages`, and on a Mac (`util::mac_host`) too – there
+/// `place_on_pages` makes them with the flags D3DMetal shares pages with (`native_page_flags`).
+/// GPU-owned textures (`place`) follow `on_pages` alone: on a Mac they keep arenas.
+pub(super) fn sampled_on_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("XCL_VRAM_ARENAS") {
+        Ok(v) => v.trim() == "0",
+        Err(_) => on_pages() || crate::util::mac_host(),
+    })
+}
+
 /// A sampled texture of the title at `va` (`desc`: the PC description, `console_bytes` its size on
 /// the console) backed by shared 64 KiB video-memory pages; None when reserved placement is not
 /// available (the caller falls back to a committed resource).
@@ -793,9 +805,10 @@ pub unsafe fn place_pages(
     ppv: *mut *mut c_void,
 ) -> Option<HRESULT> {
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
-    // (not on a native host unless asked, `on_pages`: there two reserved textures on the same
-    // pages do not show each other's contents – the caller's committed texture is used)
-    if !tier2(dev) || !on_pages() {
+    // (`sampled_on_pages`: not on a native host other than a Mac unless asked – there two reserved
+    // textures on the same pages do not show each other's contents; the caller's committed
+    // texture is used)
+    if !tier2(dev) || !sampled_on_pages() {
         return None;
     }
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, riid, ppv)
