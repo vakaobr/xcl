@@ -1831,6 +1831,7 @@ pub(super) unsafe fn forget_released(this: usize) {
     }
     super::sparse::forget_buffer(this);
     super::vram::forget(this);
+    super::level_tiles::forget(this);
     super::title_textures::forget(this);
     let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&this));
     if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {

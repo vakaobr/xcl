@@ -358,7 +358,11 @@ struct Layout {
 /// The `Layout` of uploading `subs` into `res`, checked against the resource.
 unsafe fn layout(dev: &ID3D12Device, res: &ID3D12Resource, subs: &[Subresource], before: &[D3D12_RESOURCE_STATES], after: &[D3D12_RESOURCE_STATES]) -> Result<Layout, String> {
     validate_subresources(subs)?;
-    let rd = res.GetDesc();
+    let mut rd = res.GetDesc();
+    if rd.Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE {
+        // (a reserved texture: its footprints are those of the plain description)
+        rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    }
     let n = subs.len();
     validate_subresource_count(&rd, n)?;
     for s in [before, after] {

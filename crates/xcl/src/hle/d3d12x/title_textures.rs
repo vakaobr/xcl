@@ -473,6 +473,18 @@ pub fn note_gpu_write(res: usize) {
             }
         }
     }
+    if let Some(device) = super::level_tiles::device_of(res) {
+        // (a texture whose levels get memory as they are loaded: what the GPU writes needs
+        // memory under all of it)
+        let d = device as *mut c_void;
+        unsafe {
+            if let Some(dev) = ID3D12Device::from_raw_borrowed(&d) {
+                if let Ok(queue) = upload_queue(dev, device) {
+                    super::level_tiles::map_all(&queue, res);
+                }
+            }
+        }
+    }
     let mut marked = false;
     {
         let mut t = TEXTURES.lock().unwrap();
@@ -1149,6 +1161,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         };
         match own_work(|| {
             super::vram::before_execute(&queue);
+            super::level_tiles::map_for(&queue, &batch);
             texture::upload_batch(dev, &queue, &batch)
         }) {
             Ok(failed) => {
@@ -1178,7 +1191,7 @@ unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) {
 }
 
 /// Whether every byte of `b` is zero (eight at a time: gigabytes a second where it is).
-fn all_zero(b: &[u8]) -> bool {
+pub(super) fn all_zero(b: &[u8]) -> bool {
     let mut words = b.chunks_exact(8);
     words.all(|w| u64::from_ne_bytes(w.try_into().unwrap()) == 0) && words.remainder().iter().all(|&x| x == 0)
 }
