@@ -4486,6 +4486,9 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
 
         // Submit 1: reads slot 0 -> in_a (sparse VRAM) + arg_table constant 77 (Window 3)
         record_and_run(1, true);
+        // the copy back of what the shader stored lands asynchronously: before a CPU read the
+        // title's lists are done for, XCL settles it (as in Map and the CPU memory waits)
+        crate::hle::d3d12x::sparse::settle_readbacks();
         for l in 0..64usize {
             let got = *((out_buf + 4 * l) as *const u32);
             assert_eq!(got, 1000 + l as u32 + 77, "submit 1 lane {l} mismatch");
@@ -4496,6 +4499,7 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
         *((in_b + 4 * 3) as *mut u32) = 9999;
         crate::hle::d3d12x::console_heap::write(&slot0, &vsharp(in_b));
         record_and_run(2, false);
+        crate::hle::d3d12x::sparse::settle_readbacks();
         for l in 0..64usize {
             let expected = if l == 3 { 9999 + 13 } else { 5000 + 2 * l as u32 + 13 };
             let got = *((out_buf + 4 * l) as *const u32);

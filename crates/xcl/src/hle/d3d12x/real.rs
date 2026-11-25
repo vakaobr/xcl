@@ -2913,7 +2913,11 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::PipelineState => v.push(("Release", pso_release as usize)),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         Kind::Heap => v.push(("Release", mem_heap_release as usize)),
-        Kind::Fence => v.push(("Signal", fence_signal as usize)),
+        Kind::Fence => v.extend_from_slice(&[
+            ("Signal", fence_signal as usize),
+            ("GetCompletedValue", fence_get_completed_value as usize),
+            ("SetEventOnCompletion", fence_set_event_on_completion as usize),
+        ]),
         _ => {}
     }
     v
@@ -3190,6 +3194,39 @@ pub(super) unsafe fn create_raw_pc_command_list(
     };
     (hr >= 0 && !out.is_null()).then_some(out)
 }
+/// A command allocator and a closed list of XCL's own, made with the device's own methods past
+/// XCL's hooks, as the objects made before the device is adopted are: neither is adopted, so
+/// none of the list hooks (`cl_close`, `cl_reset`, the copy hooks) run for work XCL submits on
+/// a queue of its own.
+pub(super) unsafe fn create_own_list(dev: &ID3D12Device, ty: D3D12_COMMAND_LIST_TYPE) -> Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+    let d = dev.as_raw();
+    if !is_adopted(d) {
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).ok()?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).ok()?;
+        list.Close().ok()?;
+        return Some((alloc, list));
+    }
+    let iface = layout::find("ID3D12Device")?;
+    type Alloc = unsafe extern "system" fn(*mut c_void, D3D12_COMMAND_LIST_TYPE, *const GUID, *mut *mut c_void) -> HRESULT;
+    type List = unsafe extern "system" fn(*mut c_void, u32, D3D12_COMMAND_LIST_TYPE, *mut c_void, *mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+    let create_alloc: Alloc = std::mem::transmute(orig_fn(d, layout::slot(iface, "CreateCommandAllocator")?));
+    let create_list: List = std::mem::transmute(orig_fn(d, layout::slot(iface, "CreateCommandList")?));
+    let mut a = std::ptr::null_mut();
+    let iid = &ID3D12CommandAllocator::IID as *const windows::core::GUID as *const GUID;
+    if create_alloc(d, ty, iid, &mut a) < 0 || a.is_null() {
+        return None;
+    }
+    let alloc = ID3D12CommandAllocator::from_raw(a);
+    let mut l = std::ptr::null_mut();
+    let iid = &ID3D12GraphicsCommandList::IID as *const windows::core::GUID as *const GUID;
+    if create_list(d, 0, ty, a, std::ptr::null_mut(), iid, &mut l) < 0 || l.is_null() {
+        return None;
+    }
+    let list = ID3D12GraphicsCommandList::from_raw(l);
+    list.Close().ok()?;
+    Some((alloc, list))
+}
+
 creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHeap, [a1]);
 creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
 creator!(dev_create_committed_resource1, "CreateCommittedResource1", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
@@ -7166,6 +7203,76 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
+    }
+    hr
+}
+
+/// Fence::GetCompletedValue. What the title's lists wrote into its sparse memory comes back
+/// asynchronously (`sparse::readback_after_execute`): the copies back the value covers land first.
+unsafe extern "system" fn fence_get_completed_value(this: *mut c_void) -> u64 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, slot_of(this, "GetCompletedValue")));
+    let v = f(this);
+    super::sparse::settle_readbacks_try();
+    v
+}
+
+/// A `fence_set_event_on_completion` wait: the title's event, XCL's own event the fence sets, and
+/// the thread-pool wait on it (0 until registered)
+struct FenceWait {
+    own: *mut c_void,
+    title: *mut c_void,
+    wait: AtomicUsize,
+}
+
+unsafe extern "system" fn fence_wait_fired(ctx: *mut c_void, _timed_out: bool) {
+    use windows_sys::Win32::System::Threading::{SetEvent, UnregisterWaitEx};
+    let w = ctx as *mut FenceWait;
+    super::sparse::settle_readbacks_try();
+    SetEvent((*w).title);
+    let mut wh = (*w).wait.load(Ordering::Acquire);
+    while wh == 0 {
+        std::hint::spin_loop();
+        wh = (*w).wait.load(Ordering::Acquire);
+    }
+    // no completion event: the registration goes once this callback returns
+    UnregisterWaitEx(wh as *mut c_void, std::ptr::null_mut());
+    windows_sys::Win32::Foundation::CloseHandle((*w).own);
+    drop(Box::from_raw(w));
+}
+
+/// Fence::SetEventOnCompletion. Once copies back land asynchronously, the title's event is set
+/// after the fence is reached and the copies back it covers landed: the fence sets an event of
+/// XCL's own, and a thread-pool wait on that settles them and sets the title's. A null event
+/// (a blocking wait) settles them after it.
+unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value: u64, event: *mut c_void) -> HRESULT {
+    use windows_sys::Win32::System::Threading::{CreateEventW, RegisterWaitForSingleObject, UnregisterWaitEx, INFINITE, WT_EXECUTEONLYONCE};
+    let f: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "SetEventOnCompletion")));
+    if event.is_null() || !super::sparse::readbacks_async() {
+        let hr = f(this, value, event);
+        if event.is_null() {
+            super::sparse::settle_readbacks_try();
+        }
+        return hr;
+    }
+    let own = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+    if own.is_null() {
+        return f(this, value, event);
+    }
+    let w = Box::into_raw(Box::new(FenceWait { own, title: event, wait: AtomicUsize::new(0) }));
+    let mut wh = std::ptr::null_mut();
+    if RegisterWaitForSingleObject(&mut wh, own, Some(fence_wait_fired), w as *const c_void, INFINITE, WT_EXECUTEONLYONCE) == 0 {
+        windows_sys::Win32::Foundation::CloseHandle(own);
+        drop(Box::from_raw(w));
+        return f(this, value, event);
+    }
+    (*w).wait.store(wh as usize, Ordering::Release);
+    let hr = f(this, value, own);
+    if hr < 0 {
+        // the event will not be set: take the wait back (waiting for a running callback)
+        if UnregisterWaitEx(wh, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE) != 0 {
+            windows_sys::Win32::Foundation::CloseHandle(own);
+            drop(Box::from_raw(w));
+        }
     }
     hr
 }

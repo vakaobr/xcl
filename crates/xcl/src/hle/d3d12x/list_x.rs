@@ -301,6 +301,8 @@ impl PendingWait {
                 Duration::from_millis(1)
             };
             std::thread::sleep(step);
+            // a value a list wrote into a sparse window reaches this memory with its copy back
+            super::sparse::settle_readbacks_try();
             if self.is_satisfied() {
                 return true;
             }
