@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use crate::config::{Boot, Config};
 use crate::util::wide;
 
+mod shader_window;
+
 /// Data root: `%XCL_DATA_ROOT%` or `%LOCALAPPDATA%\XCL`.
 pub fn data_root() -> PathBuf {
     if let Ok(p) = std::env::var("XCL_DATA_ROOT") {
@@ -286,6 +288,14 @@ fn quote(a: &str) -> String {
 }
 
 pub fn run(target: &Path, args: &[String]) -> i32 {
+    run_with_ui(target, args, false)
+}
+
+pub fn run_from_menu(target: &Path) -> i32 {
+    run_with_ui(target, &[], true)
+}
+
+fn run_with_ui(target: &Path, args: &[String], menu: bool) -> i32 {
     let (root, explicit_exe, title) = match resolve_location(target) {
         Ok(x) => x,
         Err(e) => {
@@ -383,6 +393,12 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         }
     }
 
+    if !boot.config.graphics.eq_ignore_ascii_case("null") {
+        if let Err(e) = shader_window::prepare(&root, &boot.config.d3d12_adapter, menu) {
+            eprintln!("xcl: {e}");
+            return 2;
+        }
+    }
     let mut cmdline = quote(&exe.to_string_lossy());
     for a in args {
         cmdline.push(' ');

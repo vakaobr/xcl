@@ -23,6 +23,21 @@ impl Drop for TempDir {
 }
 
 #[test]
+fn unreadable_shader_pack_stops_launch_before_host_start() {
+    let game = TempDir::new("xcl-preparation-failed");
+    std::fs::write(game.0.join("title.exe"), b"must never be loaded").unwrap();
+    std::fs::write(game.0.join("shaders.rpf"), b"9FPR").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .args(["run"]).arg(&game.0)
+        .env("XCL_DATA_ROOT", game.0.join("user"))
+        .env("XCL_SKIP_CPU_CHECK", "1")
+        .output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No readable shader records"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Log:"));
+}
+
+#[test]
 fn launcher_missing_target_argument_exits_code_two() {
     let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
         .arg("run")

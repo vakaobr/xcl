@@ -121,7 +121,7 @@ fn run_picked_game() -> i32 {
     let _ = std::fs::create_dir_all(xcl::launcher::data_root());
     let _ = std::fs::write(&last_file, target.to_string_lossy().as_bytes());
     println!("xcl run \"{}\"", target.display());
-    let code = xcl::launcher::run(&target, &[]);
+    let code = xcl::launcher::run_from_menu(&target);
     if code != 0 {
         println!("\nXCL ended with code {code}. Press Enter to close.");
         let _ = std::io::stdin().read_line(&mut String::new());
