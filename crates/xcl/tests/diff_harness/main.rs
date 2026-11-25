@@ -351,7 +351,12 @@ fn compile_c(code: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
 /// One program through the HLSL path (A) and the per-lane form (C), each run twice. Ok(true)
 /// when they match on everything but C's stale masks and the program changed something.
 fn run_one_per_lane(seed: u64) -> Result<bool, String> {
-    let (code, state, mem) = runnable_with_data(&default_knobs(seed));
+    run_one_per_lane_with(&default_knobs(seed))
+}
+
+fn run_one_per_lane_with(knobs: &gen::Knobs) -> Result<bool, String> {
+    let seed = knobs.seed;
+    let (code, state, mem) = runnable_with_data(knobs);
     let dxil_a = compile_a(&code)?;
     let (dxil_c, stale) = compile_c(&code)?;
     let ra = runner::run(&dxil_a, &state, &mem)?;
@@ -395,4 +400,55 @@ fn test_long_sweep_per_lane() {
     eprintln!("per_lane_sweep: {tested} tested, {nontrivial} changed memory or registers, {refused} refused, {failures} differences, {unstable_a} unstable on A, {unstable_c} unstable on C");
     assert_eq!(failures, 0);
     assert_eq!(unstable_c, 0);
+}
+
+/// As `test_long_sweep_per_lane`, with no divergent `if`s (uniform loops only): the per-lane
+/// form refuses a value written while some lanes were elsewhere and read after they met again,
+/// and every program with a divergent `if` here has one.
+#[test]
+#[ignore]
+fn test_long_sweep_per_lane_uniform() {
+    if !gpu_and_dxc_ready() { return; }
+    let (mut tested, mut nontrivial, mut refused, mut failures, mut unstable_a, mut unstable_c) = (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+    let mut reasons: std::collections::BTreeMap<String, u32> = Default::default();
+    for seed in 0..1000u64 {
+        match run_one_per_lane_with(&gen::Knobs { divergent_pct: 0, ..default_knobs(seed) }) {
+            Ok(changed) => { tested += 1; nontrivial += changed as u32; }
+            Err(e) if e.starts_with("refused") || e.starts_with("unsupported") => {
+                refused += 1;
+                *reasons.entry(e.lines().next().unwrap_or("").chars().take(120).collect()).or_default() += 1;
+            }
+            Err(e) if e.starts_with("unstable A") => { eprintln!("{e}"); unstable_a += 1; }
+            Err(e) if e.starts_with("unstable C") => { eprintln!("{e}"); unstable_c += 1; }
+            Err(e) => { eprintln!("{e}"); failures += 1; }
+        }
+    }
+    for (r, n) in &reasons { eprintln!("refused x{n}: {r}"); }
+    eprintln!("per_lane_uniform_sweep: {tested} tested, {nontrivial} changed memory or registers, {refused} refused, {failures} differences, {unstable_a} unstable on A, {unstable_c} unstable on C");
+    assert_eq!(failures, 0);
+    assert_eq!(unstable_c, 0);
+}
+
+/// Diagnostic (XCL_DIFF_SEED, uniform knobs): A (HLSL), B (#1426 per-instruction), C (#1745
+/// per-lane) on one seed, then the program minimised to what still makes A and C differ.
+#[test]
+#[ignore]
+fn explain_per_lane_seed() {
+    if !gpu_and_dxc_ready() { return; }
+    let Some(seed) = std::env::var("XCL_DIFF_SEED").ok().and_then(|s| s.parse::<u64>().ok()) else { return };
+    let knobs = gen::Knobs { divergent_pct: 0, ..default_knobs(seed) };
+    let (code, state, mem) = runnable_with_data(&knobs);
+    let run3 = |c: &[u8]| -> Option<(runner::KernelResult, runner::KernelResult, runner::KernelResult, Vec<u8>)> {
+        let a = compile_a(c).ok()?; let b = compile_b(c).ok()?; let (cc, stale) = compile_c(c).ok()?;
+        Some((runner::run(&a, &state, &mem).ok()?, runner::run(&b, &state, &mem).ok()?, runner::run(&cc, &state, &mem).ok()?, stale))
+    };
+    let (ra, rb, rc, _) = run3(&code).expect("all three paths");
+    eprintln!("seed {seed}: A vs B {} diffs, A vs C {}, B vs C {}", compare::compare(&ra, &rb).len(), compare::compare(&ra, &rc).len(), compare::compare(&rb, &rc).len());
+    let differs = |c: &[u8]| run3(c).is_some_and(|(a, _, cc, _)| !compare::compare(&a, &cc).is_empty());
+    let shrunk = minimise::minimise_ops(&knobs, &|k| differs(&runnable_with_data(k).0));
+    let (c, _, _) = runnable_with_data(&shrunk);
+    let min = minimise::minimise_instructions(&c, &shrunk.options(), &differs);
+    minimise::print_minimised(&shrunk, &min);
+    let (a, b, cc, _) = run3(&min).unwrap();
+    eprintln!("minimised: A vs B {} diffs, A vs C {}:\n{}", compare::compare(&a, &b).len(), compare::compare(&a, &cc).len(), compare::format_diffs(&compare::compare(&a, &cc), 8));
 }
