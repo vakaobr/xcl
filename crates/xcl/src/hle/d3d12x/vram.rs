@@ -1316,6 +1316,19 @@ fn tier2(dev: &ID3D12Device) -> bool {
     unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.ResourceHeapTier.0 >= 2 }
 }
 
+/// Whether title textures stay off the shared pages (`place_pages`, `place`): `XCL_VRAM_ARENAS`
+/// is set. On a Mac (`util::mac_host`) also when it is unset, and `=0` puts them on the pages:
+/// there a sampled texture gets pages under every level, where the level tiles (`level_tiles`)
+/// give a streamed texture memory level by level once `place_pages` says no – a retail title's
+/// loading was at 16.5 GB wired with the pages and 12.3 – 14.0 GB with the level tiles
+/// (shortside, #258).
+fn arenas() -> bool {
+    match std::env::var("XCL_VRAM_ARENAS") {
+        Ok(v) => !(crate::util::mac_host() && v.trim() == "0"),
+        Err(_) => crate::util::mac_host(),
+    }
+}
+
 /// A sampled texture of the title at `va` (`desc`: the PC description, `console_bytes` its size on
 /// the console) backed by shared 64 KiB video-memory pages; None when reserved placement is not
 /// available (the caller falls back to a committed resource).
@@ -1331,7 +1344,7 @@ pub unsafe fn place_pages(
     ppv: *mut *mut c_void,
 ) -> Option<HRESULT> {
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
-    if !tier2(dev) || std::env::var_os("XCL_VRAM_ARENAS").is_some() {
+    if !tier2(dev) || arenas() {
         return None;
     }
     if console_has_packed_3d_mips(desc) {
@@ -1424,7 +1437,7 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     if !tier2(dev) {
         return None;
     }
-    if std::env::var_os("XCL_VRAM_ARENAS").is_none() {
+    if !arenas() {
         if let Some(hr) = place_on_pages(dev, this, va, desc, state, clear, console_bytes, true, false, riid, ppv) {
             return Some(hr);
         }
@@ -1930,6 +1943,9 @@ mod tests {
     fn sampled_textures_at_one_address_share_their_pages_in_every_slice() {
         let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::gpu::recomp::runner::skip_test;
+        if arenas() {
+            return skip_test("title textures are not on shared pages on this host (XCL_VRAM_ARENAS)");
+        }
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::*;
         use windows::Win32::Graphics::Dxgi::*;
@@ -2050,6 +2066,9 @@ mod tests {
     fn render_targets_at_one_address_share_their_pages() {
         let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::gpu::recomp::runner::skip_test;
+        if arenas() {
+            return skip_test("title textures are not on shared pages on this host (XCL_VRAM_ARENAS)");
+        }
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::*;
         use windows::Win32::Graphics::Dxgi::*;
