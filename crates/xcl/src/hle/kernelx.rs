@@ -39,6 +39,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         // memory
         VirtualAlloc,
         VirtualAllocEx,
+        CreateThread,
         VirtualFree,
         VirtualFreeEx,
         VirtualProtect,
@@ -516,6 +517,20 @@ pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p
 
 pub unsafe extern "system" fn VirtualProtectEx(proc_: HANDLE, addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
     mem::VirtualProtectEx(proc_, addr, size, sanitize_protect(p), old)
+}
+
+/// Smallest stack a title thread gets. Console titles ask for stacks sized for the console's
+/// own D3D12 (1 MiB here); on a PC a pipeline creation on the title's thread also runs XCL's
+/// shader translation and the host driver's compiler (Apple's D3DMetal converts shaders on the
+/// calling thread), and overflowed it.
+pub const MIN_TITLE_STACK: usize = 16 << 20;
+
+/// kernel32!CreateThread for the title: the stack size becomes a reservation of at least
+/// `MIN_TITLE_STACK`.
+pub unsafe extern "system" fn CreateThread(sa: *const c_void, stack: usize, start: usize, param: *const c_void, flags: u32, tid: *mut u32) -> HANDLE {
+    const STACK_SIZE_PARAM_IS_A_RESERVATION: u32 = 0x1_0000;
+    let (stack, flags) = if stack < MIN_TITLE_STACK { (MIN_TITLE_STACK, flags | STACK_SIZE_PARAM_IS_A_RESERVATION) } else { (stack, flags) };
+    windows_sys::Win32::System::Threading::CreateThread(sa as *const _, stack, std::mem::transmute::<usize, windows_sys::Win32::System::Threading::LPTHREAD_START_ROUTINE>(start), param, flags, tid)
 }
 
 /// XALLOC_ATTRIBUTES bit fields.

@@ -455,7 +455,7 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
         run_tls_callbacks(m, 1);
     }
     READY.store(true, Ordering::Release);
-    let stack = (m.stack_reserve as usize).max(1 << 20);
+    let stack = (m.stack_reserve as usize).max(crate::hle::kernelx::MIN_TITLE_STACK);
     let args = Box::into_raw(Box::new(EntryArgs { entry: m.base + m.entry_rva as usize }));
     crate::xlog_info!(
         "start {}: entry point {} , stack {:#x}",
