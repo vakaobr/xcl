@@ -6,9 +6,10 @@
 //! disassembly is written next to the blob. This is how we learn, per title, whether
 //! shaders still carry DXIL/DXBC or only console GPU microcode.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -268,39 +269,58 @@ fn resident_and_readable(p: usize, end: usize) -> bool {
     })
 }
 
+fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
+    let mut g = STATE.lock().unwrap();
+    f(g.get_or_insert_with(|| State { seen: HashSet::new(), stats: ShaderStats::default(), insts: xbox::InstStats::default() }))
+}
+
+fn inc_key(map: &mut BTreeMap<String, usize>, key: &str) {
+    match map.get_mut(key) {
+        Some(n) => *n += 1,
+        None => { map.insert(key.to_string(), 1); }
+    }
+}
+
 /// Record a shader blob submitted by the title. Safe on garbage pointers.
 pub fn capture(stage: &str, ptr: usize, len: usize) {
     if ptr == 0 && len == 0 {
         return; // unused stage
     }
-    let mut g = STATE.lock().unwrap();
-    let st = g.get_or_insert_with(|| State { seen: HashSet::new(), stats: ShaderStats::default(), insts: xbox::InstStats::default() });
-    st.stats.submitted += 1;
     if !readable(ptr, len) {
-        st.stats.rejected_pointers += 1;
-        if st.stats.rejected_pointers <= 5 {
+        let rejected = with_state(|st| {
+            st.stats.submitted += 1;
+            st.stats.rejected_pointers += 1;
+            st.stats.rejected_pointers
+        });
+        if rejected <= 5 {
             crate::xlog_warn!("[SHADER] {stage}: invalid pointer/size ({ptr:#x}, {len}) – different struct layout on the console?");
         }
         return;
     }
-    let blob = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }.to_vec();
-    let h = fnv64(&blob);
-    *st.stats.by_stage.entry(stage.to_string()).or_default() += 1;
-    if !st.seen.insert(h) {
+    let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    let h = fnv64(slice);
+    let is_new = with_state(|st| {
+        st.stats.submitted += 1;
+        inc_key(&mut st.stats.by_stage, stage);
+        st.seen.insert(h)
+    });
+    if !is_new {
         return;
     }
-    st.stats.unique += 1;
+    let blob = slice.to_vec();
     let (kind, parts) = classify(&blob);
-    *st.stats.by_kind.entry(kind.label().to_string()).or_default() += 1;
-    for p in parts.iter().filter(|p| !KNOWN_PARTS.contains(&p.fourcc.as_str())) {
-        *st.stats.unknown_parts.entry(p.fourcc.clone()).or_default() += 1;
-    }
-    drop(g);
+    with_state(|st| {
+        st.stats.unique += 1;
+        inc_key(&mut st.stats.by_kind, kind.label());
+        for p in parts.iter().filter(|p| !KNOWN_PARTS.contains(&p.fourcc.as_str())) {
+            *st.stats.unknown_parts.entry(p.fourcc.clone()).or_default() += 1;
+        }
+    });
     if !dumps_enabled() {
         let names: Vec<&str> = parts.iter().map(|p| p.fourcc.as_str()).collect();
         crate::xlog_info!("[SHADER] {stage} {h:016x}: {} B, format {}, parts [{}]", blob.len(), kind.label(), names.join(","));
         if kind == Kind::XboxNative {
-            account_xbox(&blob, h);
+            enqueue_xbox_account(blob, h);
         }
         return;
     }
@@ -329,6 +349,71 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
 fn dumps_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_DUMP_SHADERS").is_ok_and(|v| v == "1"))
+}
+
+/// Background worker for `account_xbox`: keeps FSSM decompression and RDNA2 instruction
+/// counting off the title's pipeline-loading threads; `stats()` flushes it before reading.
+struct AccountWorker {
+    state: Mutex<(VecDeque<(Vec<u8>, u64)>, usize)>,
+    work_cv: Condvar,
+    done_cv: Condvar,
+}
+
+static XBOX_ACCOUNT_WORKER: OnceLock<Option<Arc<AccountWorker>>> = OnceLock::new();
+
+fn xbox_account_worker() -> Option<&'static Arc<AccountWorker>> {
+    XBOX_ACCOUNT_WORKER.get_or_init(|| {
+        let w = Arc::new(AccountWorker { state: Mutex::new((VecDeque::new(), 0)), work_cv: Condvar::new(), done_cv: Condvar::new() });
+        let worker = Arc::clone(&w);
+        let started = std::thread::Builder::new().name("xcl-shader-stats".into()).spawn(move || {
+            unsafe {
+                use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+            }
+            struct PendingGuard<'a>(&'a AccountWorker);
+            impl Drop for PendingGuard<'_> {
+                fn drop(&mut self) {
+                    let mut g = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+                    g.1 -= 1;
+                    if g.1 == 0 {
+                        self.0.done_cv.notify_all();
+                    }
+                }
+            }
+            loop {
+                let (blob, h) = {
+                    let mut g = worker.state.lock().unwrap_or_else(|e| e.into_inner());
+                    while g.0.is_empty() {
+                        g = worker.work_cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                    }
+                    g.0.pop_front().unwrap()
+                };
+                let _done = PendingGuard(&worker);
+                account_xbox(&blob, h);
+            }
+        });
+        started.ok().map(|_| w)
+    }).as_ref()
+}
+
+fn enqueue_xbox_account(blob: Vec<u8>, h: u64) {
+    let Some(w) = xbox_account_worker() else { return account_xbox(&blob, h) };
+    let mut g = w.state.lock().unwrap_or_else(|e| e.into_inner());
+    g.1 += 1;
+    g.0.push_back((blob, h));
+    w.work_cv.notify_one();
+}
+
+fn flush_xbox_account(timeout: Duration) {
+    let Some(Some(w)) = XBOX_ACCOUNT_WORKER.get() else { return };
+    let deadline = Instant::now() + timeout;
+    let mut g = w.state.lock().unwrap_or_else(|e| e.into_inner());
+    while g.1 > 0 {
+        let Some(rem) = deadline.checked_duration_since(Instant::now()) else { break };
+        let (next, res) = w.done_cv.wait_timeout(g, rem).unwrap_or_else(|e| e.into_inner());
+        g = next;
+        if res.timed_out() { break; }
+    }
 }
 
 /// Console container without dumps: its FSSM variants and instructions accounted.
@@ -425,6 +510,7 @@ fn recompile(blob: &[u8], sh: &xbox::XboxShader, base: &std::path::Path) {
 }
 
 pub fn stats() -> ShaderStats {
+    flush_xbox_account(Duration::from_secs(5));
     let g = STATE.lock().ok();
     let mut s = g.as_ref().and_then(|g| g.as_ref().map(|st| st.stats.clone())).unwrap_or_default();
     if let Some(st) = g.as_ref().and_then(|g| g.as_ref()) {
@@ -545,5 +631,69 @@ mod tests {
         let v = vec![1u8; 32 << 12];
         assert!(!resident_and_readable(v.as_ptr() as usize, v.as_ptr() as usize + v.len()));
         assert!(readable(v.as_ptr() as usize, v.len()));
+    }
+
+    static CAPTURE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn unique_console_shader(nops: usize) -> (Vec<u8>, u64) {
+        use crate::gpu::xbox::tests::{fssm, sample, CODE};
+        let mut code = Vec::with_capacity(nops * 4 + CODE.len());
+        (0..nops).for_each(|_| code.extend_from_slice(&[0x00, 0x00, 0x80, 0xbf]));
+        code.extend_from_slice(&CODE);
+        let blob = sample(0, &[fssm(&code, &[(5, 1)])]);
+        let mut st = xbox::InstStats::default();
+        st.add_shader(&xbox::parse(&blob).unwrap());
+        (blob, st.instructions)
+    }
+
+    fn delta(after: &BTreeMap<String, usize>, before: &BTreeMap<String, usize>, k: &str) -> usize {
+        after.get(k).copied().unwrap_or(0) - before.get(k).copied().unwrap_or(0)
+    }
+
+    #[test]
+    fn capture_deduplicates_across_threads_and_flushes_xbox_stats() {
+        let _guard = CAPTURE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (blob, expected_insts) = unique_console_shader(7);
+        let blob = Arc::new(blob);
+        let before = stats();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let b = Arc::clone(&blob);
+                std::thread::spawn(move || (0..20).for_each(|_| capture("ps", b.as_ptr() as usize, b.len())))
+            })
+            .collect();
+        handles.into_iter().for_each(|h| h.join().unwrap());
+        let after = stats();
+        assert_eq!(after.submitted - before.submitted, 160);
+        assert_eq!(delta(&after.by_stage, &before.by_stage, "ps"), 160);
+        assert_eq!(after.unique - before.unique, 1);
+        assert_eq!(delta(&after.by_kind, &before.by_kind, "xbox-native"), 1);
+        assert_eq!(delta(&after.xbox_hw_stages, &before.xbox_hw_stages, "PS"), 1);
+        assert_eq!(after.rdna2_instructions - before.rdna2_instructions, expected_insts);
+    }
+
+    #[test]
+    fn capture_flushes_multiple_unique_console_shaders_from_worker() {
+        let _guard = CAPTURE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let items: Vec<_> = (10..26).map(unique_console_shader).collect();
+        let expected_insts: u64 = items.iter().map(|(_, n)| *n).sum();
+        let before = stats();
+        items.iter().for_each(|(b, _)| capture("ps", b.as_ptr() as usize, b.len()));
+        let after = stats();
+        assert_eq!(after.unique - before.unique, items.len());
+        assert_eq!(delta(&after.xbox_hw_stages, &before.xbox_hw_stages, "PS"), items.len());
+        assert_eq!(after.rdna2_instructions - before.rdna2_instructions, expected_insts);
+    }
+
+    #[test]
+    fn capture_rejects_unreadable_pointer_without_polluting_seen() {
+        let _guard = CAPTURE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = stats();
+        capture("vs", 0x10, 64);
+        let after = stats();
+        assert_eq!(after.submitted - before.submitted, 1);
+        assert_eq!(after.rejected_pointers - before.rejected_pointers, 1);
+        assert_eq!(after.unique, before.unique);
+        assert_eq!(after.by_stage.get("vs"), before.by_stage.get("vs"));
     }
 }
