@@ -2,7 +2,8 @@
 //! its sockets fail as they do there (name not resolved / network unreachable); nothing is
 //! answered in a server's place. Loopback connections stay (titles make socket pairs), and so
 //! do lookups of the local names (none, this machine's, localhost). Only
-//! the title's own imports are concerned (the game's exe and DLLs); off by default.
+//! the title's own imports are concerned (the game's exe and DLLs); off by default, except on a
+//! Mac (`enabled`), where `XCL_NETWORK=1` gives the title its network.
 //!
 //! For titles under bring-up: a crash reporter otherwise uploads a memory dump of the process
 //! on every crash.
@@ -58,8 +59,18 @@ fn local_name(name: &str) -> bool {
     }
 }
 
+/// Whether the title's network is off: `XCL_NETWORK=0` off, `=1` on; unset: off on a Mac
+/// (`util::mac_host`) only, where titles are under bring-up and their crash reporters would
+/// upload a dump at each crash.
 pub fn enabled() -> bool {
-    std::env::var("XCL_NETWORK").is_ok_and(|v| v.trim() == "0")
+    enabled_from(std::env::var("XCL_NETWORK").ok().as_deref(), crate::util::mac_host())
+}
+
+fn enabled_from(var: Option<&str>, mac: bool) -> bool {
+    match var {
+        Some(v) => v.trim() == "0",
+        None => mac,
+    }
 }
 
 /// (name, address, ws2_32 ordinal – 0: imported by name only)
@@ -303,6 +314,14 @@ unsafe extern "system" fn getaddrinfo_ex(n: *const u16, s: *const u16, ns: u32, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_network_is_off_on_a_mac_unless_asked_for() {
+        assert!(enabled_from(None, true));
+        assert!(!enabled_from(None, false));
+        assert!(enabled_from(Some("0"), false));
+        assert!(!enabled_from(Some("1"), true));
+    }
 
     #[test]
     fn only_loopback_goes_through() {
