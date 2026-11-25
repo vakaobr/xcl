@@ -992,8 +992,11 @@ unsafe fn place_on_pages(
     // reserved textures have the PC's 64 KiB tiles
     let mut tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..*desc };
     if crate::util::mac_host() {
-        // render and depth targets: their sharing was not probed on D3DMetal, they keep arenas
-        if require_aligned || desc.Flags.0 & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0) != 0 {
+        // depth targets keep arenas: one cleared through a reserved texture reads back scrambled
+        // through another on the same tiles (D32_FLOAT: 3968 of 4096 texels); of the other
+        // GPU-owned textures (`place`) only render targets were probed
+        let render_target = desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0;
+        if (require_aligned && !render_target) || desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
             return None;
         }
         let mut f = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: desc.Format, ..Default::default() };
@@ -2037,6 +2040,91 @@ mod tests {
                 assert!(wrong.is_empty(), "format {}: read through the other texture: {}", format.0, wrong.join(", "));
                 drop((a, b));
             }
+        }
+    }
+
+    /// Two render targets placed at one address (`place`, as a title's render target is) are on
+    /// its shared pages, and what a clear writes through one the other reads back. On a Mac they
+    /// kept arenas. Needs a hardware adapter (skips on WARP).
+    #[test]
+    fn render_targets_at_one_address_share_their_pages() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::gpu::recomp::runner::skip_test;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return skip_test("no GPU") };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return skip_test("no GPU");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return skip_test("no GPU") };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let sample = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+            let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 256, Height: 256, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: sample, Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ..Default::default() };
+            let va = 0x62_0000_0000;
+            let place_at = || {
+                let mut p = std::ptr::null_mut();
+                let hr = place(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), None, riid, &mut p);
+                assert!(hr.is_some_and(|hr| hr >= 0) && !p.is_null(), "not placed at {va:#x}");
+                let on_pages = PAGES.lock().unwrap().values().flatten().any(|pages| pages.targets.contains_key(&(p as usize)));
+                assert!(on_pages, "render target not placed on the pages at {va:#x}");
+                ID3D12Resource::from_raw(p)
+            };
+            let (a, b) = (place_at(), place_at());
+            let rtv_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() }).unwrap();
+            let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+            dev.CreateRenderTargetView(&a, None, rtv);
+            let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0u64;
+            dev.GetCopyableFootprints(&a.GetDesc(), 0, 1, 0, Some(&mut layout), None, None, Some(&mut total));
+            let buffer = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: sample, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+            let mut readback: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback).unwrap();
+            let readback = readback.unwrap();
+            let barrier = |r: &ID3D12Resource, from: D3D12_RESOURCE_STATES, to: D3D12_RESOURCE_STATES| {
+                let t = D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(r), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, StateBefore: from, StateAfter: to };
+                D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(t) }, ..Default::default() }
+            };
+            let run = |record: &dyn Fn(&ID3D12GraphicsCommandList)| {
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                record(&list);
+                list.Close().unwrap();
+                before_execute(&queue);
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                crate::gpu::texture::wait(&dev, &queue).unwrap();
+            };
+            // cleared through `a` (values a UNORM8 holds exactly) ...
+            let want = [51u8, 102, 153, 255];
+            run(&|list| {
+                list.ResourceBarrier(&[barrier(&a, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+                list.ClearRenderTargetView(rtv, &want.map(|c| c as f32 / 255.0), None);
+                list.ResourceBarrier(&[barrier(&a, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON)]);
+            });
+            // ... read through `b`
+            run(&|list| {
+                let alias = D3D12_RESOURCE_ALIASING_BARRIER { pResourceBefore: std::mem::ManuallyDrop::new(None), pResourceAfter: std::mem::ManuallyDrop::new(None) };
+                let alias = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING, Anonymous: D3D12_RESOURCE_BARRIER_0 { Aliasing: std::mem::ManuallyDrop::new(alias) }, ..Default::default() };
+                list.ResourceBarrier(&[alias, barrier(&b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                let footprint = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: layout } };
+                let sub = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&b), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+                list.CopyTextureRegion(&footprint, 0, 0, 0, &sub, None);
+                list.ResourceBarrier(&[barrier(&b, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+            });
+            let mut p = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut p)).unwrap();
+            let bytes = std::slice::from_raw_parts(p as *const u8, total as usize);
+            let pitch = layout.Footprint.RowPitch as usize;
+            let wrong = (0..256usize).flat_map(|y| (0..256usize).map(move |x| y * pitch + x * 4)).filter(|&o| bytes[o..o + 4] != want).count();
+            readback.Unmap(0, None);
+            assert_eq!(wrong, 0, "{wrong} of 65536 pixels read through the other render target differ");
+            drop((a, b));
         }
     }
 
