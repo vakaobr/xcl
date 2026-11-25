@@ -224,6 +224,52 @@ fn hand_over_to<const N: usize>(ring: &Ring<N>, res: usize) -> bool {
     false
 }
 
+/// A ring entry with this bit set (an object's address is aligned, so bit 0 is free) is not a
+/// resource released for good but a Release still owed: one that came on a thread XCL did not
+/// create (`defer_release`).
+const OWED: usize = 1;
+
+/// The caller's `Release` of `res` came on a thread XCL did not create (`is_foreign_thread`):
+/// it is owed, in the ring, and the next drain runs it through `real::res_release` on a thread
+/// of XCL's or the title's. Nothing but atomics on the calling thread. With the ring full the
+/// reference is kept for good, as in `hand_over`.
+pub(super) fn defer_release(res: usize) {
+    hand_over_to(&RING, res | OWED);
+}
+
+/// Above this, a thread's stack is a native macOS thread's (D3DMetal's), not a Wine thread's.
+///
+/// Measured on an M5 Pro (CrossOver 26.3, Rosetta 2):
+///   Wine threads (test thread, 5 spawned std::threads): 0x0180ea9f .. 0x0220fb37
+///   D3DMetal threads (spy callbacks during ExecuteCommandLists): 0x7ff2063df667 .. 0x7ff2066c3677
+///
+/// Wine's thread stacks are in the low hundreds of megabytes; macOS native stacks are near the
+/// top of the 47-bit user range. 0x7000_0000_0000 (112 TB) leaves tens of TB on each side. The
+/// check is only made on a native host (`real::native_host`): on Wine on Linux a Wine thread's
+/// stack may sit in that range. The TEB pointer (`gs:[0x30]`) is not read to tell the threads
+/// apart: reading it on a D3DMetal thread hangs (measured), and the stack pointer needs no
+/// memory access at all.
+const NATIVE_STACK_BOUNDARY: usize = 0x7000_0000_0000;
+
+/// Whether the calling thread is one XCL did not create: a native host's own (D3DMetal's), with
+/// no Wine TEB. A lock of XCL's that is contended waits in Wine's ntdll there, and never returns.
+pub(super) fn is_foreign_thread() -> bool {
+    let local = 0u8;
+    let foreign = super::real::native_host() && &local as *const u8 as usize >= NATIVE_STACK_BOUNDARY;
+    // (a test's own switch, read after the check: a thread of the host's is foreign before it
+    // reads this thread-local)
+    #[cfg(test)]
+    let foreign = foreign || FORCE_FOREIGN.with(|f| f.get());
+    foreign
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `is_foreign_thread` answers true on this thread (a test of the foreign thread's Release
+    /// on a Wine thread)
+    pub(super) static FORCE_FOREIGN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
 /// upload ones.
 pub unsafe fn drain_known(seal_now: bool) {
@@ -232,10 +278,16 @@ pub unsafe fn drain_known(seal_now: bool) {
     // address cannot come again before it is forgotten)
     let handed = RING.take();
     if !handed.is_empty() {
+        // (and the Releases a thread XCL did not create owes (`OWED`): run here, through the
+        // whole of `real::res_release`)
+        let (owed, handed): (Vec<usize>, Vec<usize>) = handed.into_iter().partition(|&r| r & OWED != 0);
         for &res in &handed {
             super::real::forget_released(res);
         }
         HELD.lock().unwrap().get_or_insert_with(Held::default).open.extend(handed);
+        for res in owed {
+            super::real::res_release((res & !OWED) as *mut c_void);
+        }
     }
     if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
         return;
@@ -264,6 +316,12 @@ pub unsafe fn drain_known(seal_now: bool) {
 #[cfg(test)]
 pub(super) fn lock_held_for_test() -> impl Sized {
     HELD.lock().unwrap()
+}
+
+/// The ring's reader lock: no drain takes from the ring while a test holds it.
+#[cfg(test)]
+pub(super) fn lock_ring_for_test() -> impl Sized {
+    RING.reading.lock().unwrap()
 }
 
 #[cfg(test)]
@@ -413,5 +471,32 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), WRITERS * EACH, "none twice");
+    }
+
+    /// A Wine thread (the test thread) is not foreign: off a native host the check is not
+    /// made, and on one its stack is below the boundary.
+    #[test]
+    fn wine_thread_is_not_foreign() {
+        assert!(!is_foreign_thread(), "the test thread must not be classified as foreign");
+    }
+
+    /// Spawned std::threads are not foreign either (their stacks may be at different
+    /// addresses, but they are Wine threads with valid TEBs).
+    #[test]
+    fn spawned_threads_are_not_foreign() {
+        let handles: Vec<_> = (0..8).map(|_| std::thread::spawn(is_foreign_thread)).collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            assert!(!h.join().unwrap(), "spawned thread {i} classified as foreign");
+        }
+    }
+
+    /// With FORCE_FOREIGN set, the detection reports the thread as foreign even though
+    /// it has a TEB.  This exercises the test hook.
+    #[test]
+    fn force_foreign_flag_overrides_detection() {
+        FORCE_FOREIGN.with(|f| f.set(true));
+        assert!(is_foreign_thread(), "FORCE_FOREIGN should make it report foreign");
+        FORCE_FOREIGN.with(|f| f.set(false));
+        assert!(!is_foreign_thread(), "back to normal");
     }
 }

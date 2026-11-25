@@ -1685,8 +1685,23 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
     f(this, sub, range)
 }
 
-unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
+pub(super) unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    // A Release on a thread XCL did not create (a native host's own: D3DMetal's) runs none of
+    // what follows there: the caller's reference goes into the late-release ring, and the next
+    // drain runs it through here on a thread of XCL's or the title's. Whether it is the last one
+    // is not decided here (AddRef returning 2): a Release on another thread between that check
+    // and ours could still take the count to 0 on this thread, and what XCL keeps by the address
+    // would then be forgotten here. The count returned is what the caller's Release leaves if
+    // nothing else changes; the AddRef and its Release cannot reach 0, the caller's reference
+    // is still held.
+    if super::late_release::is_foreign_thread() {
+        let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+        let n = add(this);
+        f(this);
+        super::late_release::defer_release(this as usize);
+        return n.saturating_sub(2);
+    }
     // The last reference: kept until the queues are past the work in flight (`late_release`).
     // (Two last-but-one releases at once can miss each other here; the object then goes at
     // once, as before.)
@@ -9058,6 +9073,69 @@ mod native_host_tests {
             while UNMAPPABLE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&raw)) {
                 assert!(start.elapsed() < Duration::from_secs(5), "not forgotten by a drain");
                 super::super::late_release::drain_known(true);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// A Release on a thread XCL did not create is not made there: the caller's reference is
+    /// still held when it returns, and a drain on a thread of XCL's gives it back. A last one
+    /// is forgotten by that drain too, not on the foreign thread.
+    #[test]
+    fn a_release_on_a_foreign_thread_is_given_back_by_a_drain() {
+        use super::super::late_release::{drain_known, is_foreign_thread, lock_ring_for_test, FORCE_FOREIGN};
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let res = adopted_buffer(&dev);
+            let raw = res.as_raw();
+            // the count, read with the host's own AddRef and Release (not XCL's)
+            let count = || {
+                let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(raw, 1));
+                let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(raw, 2));
+                let n = add(raw);
+                rel(raw);
+                n - 1
+            };
+            let release_on_a_foreign_thread = |r: ID3D12Resource| {
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let foreign = std::thread::spawn(move || {
+                    FORCED.with(|f| f.set(true));
+                    FORCE_FOREIGN.with(|f| f.set(true));
+                    drop(r);
+                    done_tx.send(()).unwrap();
+                });
+                done_rx.recv_timeout(Duration::from_secs(3)).expect("the foreign thread's Release did not return");
+                foreign.join().unwrap();
+            };
+            assert!(!is_foreign_thread(), "the test thread is a Wine thread");
+
+            // not the last reference: it stays until a drain (none can take from the ring while
+            // the reader's lock is held here; the late-release thread may be running)
+            let other = res.clone();
+            assert_eq!(count(), 2);
+            let reader = lock_ring_for_test();
+            release_on_a_foreign_thread(other);
+            assert_eq!(count(), 2, "the foreign thread's Release was made on that thread");
+            drop(reader);
+            let start = Instant::now();
+            while count() != 1 {
+                assert!(start.elapsed() < Duration::from_secs(5), "the foreign thread's Release was not given back by a drain");
+                drain_known(true);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            // the last one: what XCL keeps by the address is forgotten by a drain
+            UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
+            let reader = lock_ring_for_test();
+            release_on_a_foreign_thread(res);
+            assert!(UNMAPPABLE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(raw as usize))), "forgotten on the foreign thread");
+            drop(reader);
+            let start = Instant::now();
+            while UNMAPPABLE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(raw as usize))) {
+                assert!(start.elapsed() < Duration::from_secs(5), "not forgotten by a drain");
+                drain_known(true);
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
