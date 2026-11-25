@@ -229,6 +229,11 @@ pub fn readable(p: usize, len: usize) -> bool {
     while cur < end {
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let n = unsafe { VirtualQuery(cur as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+        // (a native host's objects and blobs – Apple's D3DMetal – are in memory Windows does not
+        // know: probed by reading it under an exception guard)
+        if (n == 0 || mbi.State == windows_sys::Win32::System::Memory::MEM_FREE) && crate::hle::d3d12x::real::native_host() {
+            return unsafe { windows_sys::Win32::System::Memory::IsBadReadPtr(cur as *const _, end - cur) } == 0;
+        }
         if n == 0 || mbi.State != MEM_COMMIT || mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0 || mbi.Protect == 0 {
             return false;
         }

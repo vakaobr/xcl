@@ -745,7 +745,7 @@ pub unsafe fn orig_fn(this: *mut c_void, slot: usize) -> usize {
 static NATIVE_HOST: AtomicBool = AtomicBool::new(false);
 
 /// Whether the host's D3D12 is a native host's (`NATIVE_HOST`): an atomic read, for a Release.
-pub(super) fn native_host() -> bool {
+pub(crate) fn native_host() -> bool {
     let on = NATIVE_HOST.load(Ordering::Relaxed);
     // (a test's own switch, read after the flag: on a native host the flag is set before any
     // Release, so a thread of the host's never reads this thread-local)
