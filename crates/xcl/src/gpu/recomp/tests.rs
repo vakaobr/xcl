@@ -8914,7 +8914,7 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
     for wave64 in [true, false] {
         let t = translate(&p_all, &on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() })).unwrap();
         assert!(t.complete(), "wave64={wave64}: {:?}", t.unsupported_why);
-        if std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0") {
+        if super::emit::safe_barrier_enabled() {
             assert!(t.hlsl.contains("xcl_s_barrier();"), "wave64={wave64}: expected xcl_s_barrier()");
         }
         let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
@@ -9118,6 +9118,57 @@ fn gpu_qsad_and_mqsad() {
                 assert_eq!((v[6], v[7]), (0xCCCC_CCCC, 0xDDDD_DDDD), "direct={direct} wave64={wave64} inactive lane {l} vcc");
             }
         }
+    }
+}
+
+/// `s_barrier` in a 1024-thread group (32 hardware waves in the split form) waits for waves
+/// still working: every wave runs 1000 `v_readfirstlane`s (exchanges between its halves),
+/// writes its LDS word, and after the barrier reads the word of the farthest wave
+/// (`tid ^ 1023`). On D3DMetal (#258) the waves spinning in `xcl_s_barrier` starved the ones
+/// still in the loop until the spin gave up, and the barrier let them read too early.
+#[test]
+fn gpu_s_barrier_1024_threads_waits_for_working_waves() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None),       // v1 = tid * 4
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 0)], Some(0x100)), // v6 = tid + 0x100
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 255), ("VSRC1", 0)], Some(1023)),     // v2 = tid ^ 1023
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 2)], None),       // v2 *= 4
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 255)], Some(1000)),                 // s10 = 1000
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 128)], None),                       // s12 = 0
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V)], None),                          // v11 = tid
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 128)], None),                   // loop: s10 == 0?
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 5)], None),                                 // -> ds_write
+        ("S_SUB_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 11), ("SRC0", 129), ("VSRC1", 11)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 11)], None),           // s11 = v11 of lane 0
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 12), ("SSRC0", 12), ("SSRC1", 11)], None),          // s12 += s11
+        ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0xFFF9)], None),                                  // -> loop
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 6)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 4), ("ADDR", 2)], None),
+        ("S_WAITCNT", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 129), ("VSRC1", 4)], None),         // v4 = partner's + 1
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 0), ("VSRC1", 1)], None),           // v7 = s0 + tid * 4
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 4), ("SADDR", 0x7D)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 15), ("SRC0", 12)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 255), ("VSRC1", 7)], Some(4096)),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 15), ("SADDR", 0x7D)], None), // s12 after it
+    ]);
+    let cs = super::CsInterface { threads: [1024, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let base = 0x1000usize;
+    let out = runner::dispatch(&dxil, [1, 1, 1], &[base as u32, 0], &vec![0u32; (base + 2048 * 4) / 4]).unwrap();
+    let wrong: Vec<usize> = (0..1024).filter(|&tid| out[base / 4 + tid] != ((tid ^ 1023) + 0x101) as u32).collect();
+    assert!(wrong.is_empty(), "{} threads read their partner's LDS word before it was written (first: {:?})", wrong.len(), &wrong[..wrong.len().min(8)]);
+    for tid in 0..1024usize {
+        let cw = (tid / 64) as u32;
+        assert_eq!(out[base / 4 + 1024 + tid], 1000 * cw * 64 + 1000 * 1001 / 2, "tid={tid}: v_readfirstlane sum");
     }
 }
 
