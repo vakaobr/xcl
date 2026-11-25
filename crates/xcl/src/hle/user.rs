@@ -29,6 +29,7 @@ extern "system" {
     fn SetWindowLongPtrW(hwnd: *mut c_void, index: i32, value: isize) -> isize;
     fn CallWindowProcW(proc_: isize, hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize;
     fn SetWindowPos(hwnd: *mut c_void, after: *mut c_void, x: i32, y: i32, w: i32, h: i32, flags: u32) -> i32;
+    fn ShowWindow(hwnd: *mut c_void, cmd: i32) -> i32;
     #[allow(clippy::too_many_arguments)]
     fn CreateWindowExW(ex_style: u32, class: *const u16, title: *const u16, style: u32, x: i32, y: i32, w: i32, h: i32, parent: *mut c_void, menu: *mut c_void, instance: *mut c_void, param: *const c_void) -> *mut c_void;
 }
@@ -112,6 +113,7 @@ unsafe extern "system" fn create_window_ex_w(ex_style: u32, class: *const u16, t
 #[link(name = "dwmapi")]
 extern "system" {
     fn DwmSetWindowAttribute(hwnd: *mut c_void, attr: u32, value: *const c_void, size: u32) -> i32;
+    fn DwmGetWindowAttribute(hwnd: *mut c_void, attr: u32, value: *mut c_void, size: u32) -> i32;
 }
 
 /// the console's screen as a title's window sees it
@@ -128,15 +130,31 @@ const WS_EX_FRAME: u32 = 0x1 | 0x100 | 0x200 | 0x2_0000;
 const WS_EX_TOOLWINDOW: u32 = 0x80;
 const WS_EX_APPWINDOW: u32 = 0x4_0000;
 const GWLP_WNDPROC: i32 = -4;
+const WM_WINDOWPOSCHANGING: u32 = 0x46;
 const WM_NCDESTROY: u32 = 0x82;
 const WM_NCCALCSIZE: u32 = 0x83;
 const WM_GETMINMAXINFO: u32 = 0x24;
+const SWP_SHOWWINDOW: u32 = 0x40;
+const SW_HIDE: i32 = 0;
 const DWMWA_CLOAK: u32 = 13;
+const DWMWA_CLOAKED: u32 = 14;
 
-/// the window procedure each console window had (hwnd → procedure)
-static PROCS: std::sync::Mutex<Vec<(usize, isize)>> = std::sync::Mutex::new(Vec::new());
+#[repr(C)]
+struct WindowPos {
+    hwnd: *mut c_void,
+    insert_after: *mut c_void,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    flags: u32,
+}
 
-/// A console title's top-level window: frameless, 1920x1080, cloaked (see the module notes).
+/// the window procedure each console window had (hwnd, procedure, keep_hidden when uncloaked)
+static PROCS: std::sync::Mutex<Vec<(usize, isize, bool)>> = std::sync::Mutex::new(Vec::new());
+
+/// A console title's top-level window: frameless, 1920x1080, cloaked (or hidden when DWM
+/// cloaking is unavailable, as under Wine; see the module notes).
 #[allow(clippy::too_many_arguments)]
 unsafe fn console_window(ex_style: u32, class: *const u16, title: *const u16, style: u32, x: i32, y: i32, w: i32, h: i32, parent: *mut c_void, menu: *mut c_void, instance: *mut c_void, param: *const c_void) -> *mut c_void {
     if style & WS_CHILD != 0 {
@@ -148,23 +166,32 @@ unsafe fn console_window(ex_style: u32, class: *const u16, title: *const u16, st
     if hwnd.is_null() {
         return hwnd;
     }
-    let cloak: i32 = 1;
-    DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak as *const i32 as *const c_void, 4);
+    let cloak: u32 = 1;
+    let hr_set = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak as *const u32 as *const c_void, 4);
+    let mut cloaked: u32 = 0;
+    let hr_get = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut c_void, 4);
+    let hide = hr_set < 0 || hr_get < 0 || cloaked == 0;
     let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, console_wndproc as usize as isize);
     if old != 0 {
-        PROCS.lock().unwrap().push((hwnd as usize, old));
+        PROCS.lock().unwrap().push((hwnd as usize, old, hide));
         // SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
         SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, 0, 0, 0x2 | 0x1 | 0x4 | 0x10 | 0x20);
     }
-    crate::xlog_info!("user: the title's window {hwnd:p} is the console's screen ({CONSOLE_W}x{CONSOLE_H}, no frame, cloaked)");
+    if hide {
+        // Environments without DWM cloaking (e.g. Wine) leave the 1920x1080 title window visible
+        // over XCL's own window; hide it and strip SWP_SHOWWINDOW so it stays hidden.
+        ShowWindow(hwnd, SW_HIDE);
+    }
+    let mode = if hide { "hidden" } else { "cloaked" };
+    crate::xlog_info!("user: the title's window {hwnd:p} is the console's screen ({CONSOLE_W}x{CONSOLE_H}, no frame, {mode})");
     hwnd
 }
 
 /// A console window has no non-client area whatever its style, and may be the screen's size
 /// on a smaller PC monitor.
 unsafe extern "system" fn console_wndproc(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize {
-    let orig = PROCS.lock().unwrap().iter().find(|e| e.0 == hwnd as usize).map(|e| e.1);
-    let Some(orig) = orig else { return 0 };
+    let entry = PROCS.lock().unwrap().iter().find(|e| e.0 == hwnd as usize).map(|e| (e.1, e.2));
+    let Some((orig, hide)) = entry else { return 0 };
     match msg {
         // the client area is the whole window (wp != 0: rgrc[0] already holds the window rect)
         WM_NCCALCSIZE => 0,
@@ -176,6 +203,13 @@ unsafe extern "system" fn console_wndproc(hwnd: *mut c_void, msg: u32, wp: usize
                 m[3] = m[3].max(CONSOLE_H);
                 m[6] = m[6].max(CONSOLE_W);
                 m[7] = m[7].max(CONSOLE_H);
+            }
+            r
+        }
+        WM_WINDOWPOSCHANGING if hide => {
+            let r = CallWindowProcW(orig, hwnd, msg, wp, lp);
+            if let Some(pos) = (lp as *mut WindowPos).as_mut() {
+                pos.flags &= !SWP_SHOWWINDOW;
             }
             r
         }
@@ -200,6 +234,8 @@ mod tests {
         fn UnregisterClassW(class: *const u16, instance: usize) -> i32;
         fn GetClassInfoExW(instance: usize, class: *const u16, out: *mut WndClassEx<u16>) -> i32;
         fn DefWindowProcW(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize;
+        fn IsWindowVisible(hwnd: *mut c_void) -> i32;
+        fn DestroyWindow(hwnd: *mut c_void) -> i32;
     }
 
     #[test]
@@ -290,6 +326,53 @@ mod tests {
             VirtualFree(base, 0, MEM_RELEASE);
             assert_eq!(atom, 0);
             assert_eq!(error, windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn console_window_stays_hidden_when_uncloaked() {
+        unsafe {
+            let instance = GetModuleHandleW(std::ptr::null()) as usize;
+            let class_name = c"XclConsoleHideFallbackTest";
+            let wide_name = wide(class_name.to_str().unwrap());
+            let c = WndClassEx {
+                cb_size: std::mem::size_of::<WndClassEx<u8>>() as u32,
+                style: 0,
+                wnd_proc: DefWindowProcW as usize,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: std::ptr::null(),
+                class_name: class_name.as_ptr() as *const u8,
+                icon_small: 0,
+            };
+            let atom = RegisterClassExA(&c);
+            assert_ne!(atom, 0, "register class: error {}", GetLastError());
+            // WS_OVERLAPPEDWINDOW | WS_VISIBLE
+            let hwnd = CreateWindowExA(0, class_name.as_ptr() as *const u8, c"A".as_ptr() as *const u8, 0x10CF_0000, 100, 100, 1280, 720, std::ptr::null_mut(), std::ptr::null_mut(), instance as *mut c_void, std::ptr::null());
+            assert!(!hwnd.is_null(), "CreateWindowExA: error {}", GetLastError());
+
+            let mut rect = windows::Win32::Foundation::RECT::default();
+            windows::Win32::UI::WindowsAndMessaging::GetClientRect(windows::Win32::Foundation::HWND(hwnd), &mut rect).unwrap();
+            assert_eq!((rect.right - rect.left, rect.bottom - rect.top), (CONSOLE_W, CONSOLE_H));
+
+            let mut cloaked: u32 = 0;
+            let hr_get = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut c_void, 4);
+            // Attempt to reveal the window the way a title does after creation.
+            ShowWindow(hwnd, 5 /* SW_SHOW */);
+            SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, 0, 0, 0x2 | 0x1 | 0x4 | SWP_SHOWWINDOW);
+
+            if hr_get < 0 || cloaked == 0 {
+                assert_eq!(IsWindowVisible(hwnd), 0, "uncloaked console window must stay hidden");
+            } else {
+                assert_ne!(cloaked, 0);
+            }
+
+            assert_ne!(DestroyWindow(hwnd), 0);
+            assert_ne!(UnregisterClassW(wide_name.as_ptr(), instance), 0);
         }
     }
 }
