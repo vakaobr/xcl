@@ -1600,8 +1600,9 @@ fn used_compute(blob: &[u8], used: &std::collections::HashSet<u64>) -> bool {
     used.contains(&crate::hle::d3d12x::real::shaders_key(&[blob.to_vec()]))
 }
 
-pub(crate) struct LaunchPreparation<'a> {
-    pub adapter: &'a str,
+#[derive(Default)]
+pub(crate) struct LaunchPreparation {
+    pub adapter: String,
     pub done: AtomicUsize,
     pub total: AtomicUsize,
     pub cancel: std::sync::atomic::AtomicBool,
@@ -1653,7 +1654,7 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
 
 fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
     let pipelines = if pipelines {
-        let mut p = Pipelines::for_adapter(startup.map_or("auto", |p| p.adapter))
+        let mut p = Pipelines::for_adapter(startup.map_or("auto", |p| p.adapter.as_str()))
             .map_err(|e| format!("No pipeline device: {e}"))?;
         if startup.is_some() && std::env::var_os("XCL_PIPELINE_MAX_KB").is_none() {
             p.max_dxil = 0;
@@ -1674,7 +1675,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
     // no title runs: only a little commit is kept free besides the compiles
-    recomp::dxc::set_memory_reserve(2);
+    if startup.is_none() { recomp::dxc::set_memory_reserve(2); }
     // VS / PS: the 32-lane form wherever the GPU can run 32-lane waves (`pso::graphics_wave32`);
     // `--split` sets both
     let startup_device = pipelines.filter(|_| startup.is_some());
@@ -1708,7 +1709,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     continue;
                 };
                 let Some(sh) = xbox::parse(&blob) else {
-                    if startup.is_some() { failed.fetch_add(1, Ordering::Relaxed); }
+                    if startup.is_some() && !matches!(shader::classify(&blob).0, shader::Kind::Dxil | shader::Kind::Dxbc) {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
                     record_done();
                     continue;
                 };

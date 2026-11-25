@@ -36,6 +36,11 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+    if let Err(e) = crate::hle::d3d12x::present::preparation::before_guest(&boot) {
+        crate::xlog_error!("Shader preparation: {e}");
+        eprintln!("xcl: {e}");
+        return 2;
+    }
     let _ = std::thread::Builder::new().name("xcl-split-counts".into()).spawn(|| loop {
         std::thread::sleep(std::time::Duration::from_secs(10));
         crate::hle::d3d12x::real::log_dispatch_chain_counts();

@@ -163,6 +163,9 @@ fn test_title_runs_and_game_folder_is_untouched() {
     copy_dir(&manifest.join("..").join("..").join("tests").join("data").join("testgame"), &game);
     std::fs::copy(&title, game.join("xcl_testtitle.exe")).unwrap();
     std::fs::copy(&dll, game.join("testgame_mw.dll")).unwrap();
+    // Already-compiled graphics bytecode still goes through startup discovery.
+    std::fs::create_dir(game.join("shaders")).unwrap();
+    std::fs::copy(manifest.join("../../tests/data/dxil/dxc_vs_uav.dxil"), game.join("shaders/vertex.dxbc")).unwrap();
     let before = snapshot(&game);
 
     let out = Command::new(&xcl)
@@ -191,6 +194,10 @@ fn test_title_runs_and_game_folder_is_untouched() {
     assert!(fails.is_empty(), "failed checks in the test title:\n{}", fails.join("\n"));
     assert!(stdout.contains("xcl_testtitle: done, failures: 0"), "the test title did not run to the end");
     assert!(out.status.success(), "exit code {:?}", out.status.code());
+
+    let log = std::fs::read_to_string(data.join("XCL.TestTitle/logs/xcl.log")).unwrap();
+    let window = |tag| log.lines().find_map(|line| line.split_once(tag).map(|(_, hwnd)| hwnd)).unwrap();
+    assert_eq!(window("Shader preparation window "), window("present: swap chain window "));
 
     // (2) the game folder is untouched
     assert_eq!(snapshot(&game), before, "GAME FOLDER WAS MODIFIED");
