@@ -1054,16 +1054,42 @@ unsafe fn memory_hash_in(memory: &mut TitleMemory, at: usize, len: usize) -> u64
         let (src, same) = memory.locate(p);
         let n = same.min(at + len - p);
         if src != 0 {
-            let b = std::slice::from_raw_parts(src as *const u8, n);
-            let mut chunks = b.chunks_exact(32);
-            for c in &mut chunks {
-                for (i, lane) in l.iter_mut().enumerate() {
-                    let w = u64::from_le_bytes(c[8 * i..8 * i + 8].try_into().unwrap());
-                    *lane = (*lane ^ w).wrapping_mul(K).rotate_left(29);
+            let mut mix = |b: &[u8]| {
+                let mut chunks = b.chunks_exact(32);
+                for c in &mut chunks {
+                    for (i, lane) in l.iter_mut().enumerate() {
+                        let w = u64::from_le_bytes(c[8 * i..8 * i + 8].try_into().unwrap());
+                        *lane = (*lane ^ w).wrapping_mul(K).rotate_left(29);
+                    }
                 }
-            }
-            for (i, &x) in chunks.remainder().iter().enumerate() {
-                l[i & 3] = (l[i & 3] ^ x as u64).wrapping_mul(K).rotate_left(29);
+                for (i, &x) in chunks.remainder().iter().enumerate() {
+                    l[i & 3] = (l[i & 3] ^ x as u64).wrapping_mul(K).rotate_left(29);
+                }
+            };
+            if crate::util::mac_host() {
+                // (the title may take a page away while it is hashed: read through the copy
+                // that survives that, `guarded_copy`, 64 KiB at a time – a multiple of the 32
+                // bytes of a step, so the hash is the one of the bytes in place. A page that
+                // went counts as zeros, as an upload reads it)
+                const PIECE: usize = 0x1_0000;
+                thread_local! {
+                    static PIECE_BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; PIECE]);
+                }
+                PIECE_BUF.with(|buf| {
+                    let mut buf = buf.borrow_mut();
+                    let mut off = 0;
+                    while off < n {
+                        let m = (n - off).min(PIECE);
+                        if !super::guarded_copy::copy(src + off, buf.as_mut_ptr(), m) {
+                            buf[..m].fill(0);
+                            super::guarded_copy::copy(src + off, buf.as_mut_ptr(), m);
+                        }
+                        mix(&buf[..m]);
+                        off += m;
+                    }
+                });
+            } else {
+                mix(std::slice::from_raw_parts(src as *const u8, n));
             }
         } else {
             l[0] = (l[0] ^ n as u64 ^ 0x5555).wrapping_mul(K).rotate_left(29);
@@ -1712,6 +1738,9 @@ impl TitleMemory {
                 // copy that tolerates it leaves such a page zero. Not on a Mac: Wine's server
                 // reads another way there – it suspends the whole process for each call)
                 src if src == at && !crate::util::mac_host() => copy_committed_region(src, dst, chunk),
+                // (there a page that goes mid-copy – at the address or where a view's page
+                // is – is left out by a copy that survives the fault, `guarded_copy`)
+                src if crate::util::mac_host() => all &= super::guarded_copy::copy(src, dst, chunk),
                 src => std::ptr::copy_nonoverlapping(src as *const u8, dst, chunk),
             }
             at += chunk;
