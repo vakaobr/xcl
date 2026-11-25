@@ -806,6 +806,11 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     if dim != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 && (flags & 4) != 0 && (samples > 1 || !texture_format_allows_uav(pc_format)) {
         flags &= !4;
     }
+    // a native host: no depth + stencil formats (`depth_only`)
+    if depth_only() {
+        let f = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
+        d[0x20..0x24].copy_from_slice(&depth_only_format(f).to_le_bytes());
+    }
     d[8..16].fill(0); // alignment: the driver's
     let layout = if dim == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 { D3D12_TEXTURE_LAYOUT_ROW_MAJOR.0 } else { D3D12_TEXTURE_LAYOUT_UNKNOWN.0 };
     d[0x2C..0x30].copy_from_slice(&(layout as u32).to_le_bytes());
@@ -836,17 +841,71 @@ pub fn pc_initial_state_for_desc(orig_flags: u32, pc_flags: u32, state: u32) -> 
     }
 }
 
+/// Whether the depth + stencil families become depth-only ones: on a native D3D12 host (Apple's
+/// D3DMetal under Wine), unless `XCL_DEPTH_STENCIL=1`. Metal makes no depth-only view of a
+/// depth + stencil texture and no view in another depth family than the texture's – its
+/// assertion ("failed assertion `Texture Creation`") ends the process, where a Windows driver
+/// takes the view or refuses it – and the console reads its depth buffers through exactly such
+/// views (R24_UNORM_X8 / R32_FLOAT_X8X24 of the typeless resource, R16_UNORM of its D16S8). So
+/// there every depth + stencil family is R32_TYPELESS / D32_FLOAT / R32_FLOAT (`depth_only_format`,
+/// on top of the PC mapping above and in `pc_view_format` / `pc_shader_view_format`), and the
+/// stencil plane is lost: stencil views read the depth.
+pub fn depth_only() -> bool {
+    #[cfg(test)]
+    if let Some(on) = DEPTH_ONLY_FOR_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // (not kept before there is a device: `real::native_host` is set when it is adopted)
+    if !super::real::native_host() {
+        return false;
+    }
+    *ON.get_or_init(|| !std::env::var("XCL_DEPTH_STENCIL").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own answer for `depth_only` on its thread. The host's answer is the process's,
+    /// set by whichever test adopts a device first, so a test of the formats names its host.
+    static DEPTH_ONLY_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `depth_only` is `on` for this thread until the guard is dropped.
+#[cfg(test)]
+pub(super) fn depth_only_for_test(on: bool) -> impl Drop {
+    struct Back(Option<bool>);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            DEPTH_ONLY_FOR_TEST.with(|c| c.set(self.0));
+        }
+    }
+    Back(DEPTH_ONLY_FOR_TEST.with(|c| c.replace(Some(on))))
+}
+
+/// A depth + stencil format (R32G8X24 and R24G8 families) as the depth-only one of the same
+/// role: typeless → R32_TYPELESS, the depth format → D32_FLOAT, the planes' read formats →
+/// R32_FLOAT. Others as they are.
+pub fn depth_only_format(f: u32) -> u32 {
+    match f {
+        19 | 44 => 39,
+        20 | 45 => 40,
+        21 | 22 | 46 | 47 => 41,
+        f => f,
+    }
+}
+
 /// The PC format of a view, pipeline or clear value in the console's D16_UNORM_S8_UINT family:
 /// D24_UNORM_S8_UINT, R24_UNORM_X8_TYPELESS, X24_TYPELESS_G8_UINT (`pc_resource_desc` makes such
 /// resources R24G8_TYPELESS).
 pub fn pc_view_format(f: u32) -> u32 {
-    match f {
+    let pc = match f {
         118 => 45,
         119 => 46,
         120 => 47,
         116 | 117 => 10,
         f => f,
-    }
+    };
+    if depth_only() { depth_only_format(pc) } else { pc }
 }
 
 /// The typeless format of a depth format's family (None: not a depth format).
@@ -876,6 +935,16 @@ pub fn pc_target_format(f: u32) -> u32 {
 /// readable formats and removes the device for anything else (0x887A0001).
 pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
     let view = pc_view_format(view);
+    // a native host: the resource is of the R32 family whatever the console named (`depth_only`),
+    // and every view the console makes of a depth buffer – in its own family, the 16-bit one of
+    // its D16S8 buffer, a stencil plane, R8 of the stencil – reads its one plane
+    if depth_only() && matches!(resource, 39..=41) && matches!(view, 0 | 19..=22 | 39..=41 | 44..=47 | 53..=56 | 61 | 62) {
+        return 41;
+    }
+    // (and the other way round: a 16-bit depth buffer read through another family's format)
+    if depth_only() && matches!(resource, 53..=56) && matches!(view, 0 | 39..=41 | 53..=56) {
+        return 56;
+    }
     match (resource, view) {
         // R32G8X24_TYPELESS: depth 21, stencil 22
         (19..=22, 0 | 19 | 20 | 21 | 39 | 40 | 41) => 21,
@@ -938,6 +1007,20 @@ pub(super) unsafe fn pc_typed_uav_supported(dev_raw: *mut c_void, fmt: i32) -> b
 /// Whether a shader view in `pc_shader_view_format`'s format reads the stencil (plane 1 on the PC).
 pub fn stencil_view(resource: u32, view: u32) -> bool {
     matches!((resource, view), (19..=22, 22) | (44..=47, 47))
+}
+
+/// The format of a depth view of a resource whose PC format is `resource`, asked for as `view`
+/// (already `pc_target_format`): on a native host the depth format of the resource's family
+/// whatever was named (`depth_only`); else `view`.
+pub fn pc_depth_view_format(resource: u32, view: u32) -> u32 {
+    if !depth_only() {
+        return view;
+    }
+    match resource {
+        39..=41 => 40,
+        53..=56 => 55,
+        _ => view,
+    }
 }
 
 /// A clear value (D3D12_CLEAR_VALUE: format first) with `pc_view_format`, copied into `buf`.
@@ -1353,6 +1436,7 @@ mod tests {
     /// D24S8, no UAV flag; views get the family's readable formats (stencil from plane 1).
     #[test]
     fn console_depth_buffers_and_their_views_are_the_pcs() {
+        let _pc = depth_only_for_test(false);
         let mut x = [0u8; 0x38];
         x[0] = 3; // texture 2D
         let desc = |x: &[u8; 0x38]| {
@@ -1453,6 +1537,41 @@ mod tests {
         assert_eq!(pc_initial_state_for_desc(0x4, 0x0, 0x8), 0x0);
         assert_eq!(pc_initial_state_for_desc(0x4, 0x4, 0x8), 0x8);
         assert_eq!(pc_initial_state_for_desc(0x6, 0x2, 0x8), 0x10);
+    }
+
+    /// A native host's depth-only formats: both depth + stencil families land in the R32 one,
+    /// role for role; everything else – 16-bit depth, colour formats – stays.
+    #[test]
+    fn depth_stencil_families_become_the_r32_family() {
+        for (typeless, depth, planes) in [(19, 20, [21, 22]), (44, 45, [46, 47])] {
+            assert_eq!((depth_only_format(typeless), depth_only_format(depth)), (39, 40));
+            assert_eq!(planes.map(depth_only_format), [41, 41]);
+        }
+        for same in [0, 10, 28, 39, 40, 41, 53, 55, 56, 61, 86, 116] {
+            assert_eq!(depth_only_format(same), same);
+        }
+        // off a native host nothing changes
+        {
+            let _pc = depth_only_for_test(false);
+            assert_eq!((pc_view_format(118), pc_shader_view_format(44, 56), pc_depth_view_format(39, 45)), (45, 46, 45));
+        }
+        // on one: resources, views, pipelines' and clear values' formats, role for role
+        let _native = depth_only_for_test(true);
+        let mut x = [0u8; 0x38];
+        x[0] = 3; // texture 2D
+        x[0x30..0x34].copy_from_slice(&0x2u32.to_le_bytes()); // a depth buffer
+        for console in [118u8, 45, 20, 40] {
+            x[0x20] = console; // D16S8, D24S8, D32S8 and D32 buffers: all R32_TYPELESS
+            assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x20..0x24].try_into().unwrap()), 39, "depth buffer {console}");
+        }
+        assert_eq!((pc_view_format(118), pc_view_format(45), pc_view_format(20), pc_view_format(86)), (40, 40, 40, 86));
+        // every view the console makes of such a buffer reads its one plane, stencil views too
+        for view in [0, 21, 22, 41, 46, 47, 56, 118, 119, 120] {
+            assert_eq!(pc_shader_view_format(39, view), 41, "view {view} of the R32 buffer");
+        }
+        assert_eq!((pc_shader_view_format(53, 39), pc_shader_view_format(28, 86)), (56, 28));
+        // a depth view: the depth format of the resource's family, whatever was named
+        assert_eq!((pc_depth_view_format(39, 45), pc_depth_view_format(53, 40), pc_depth_view_format(28, 28)), (40, 55, 28));
     }
 
     #[test]
