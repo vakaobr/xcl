@@ -2639,7 +2639,11 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::PipelineState => v.push(("Release", pso_release as usize)),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         Kind::Heap => v.push(("Release", mem_heap_release as usize)),
-        Kind::Fence => v.push(("Signal", fence_signal as usize)),
+        Kind::Fence => v.extend_from_slice(&[
+            ("Signal", fence_signal as usize),
+            ("GetCompletedValue", fence_get_completed_value as usize),
+            ("SetEventOnCompletion", fence_set_event_on_completion as usize),
+        ]),
         _ => {}
     }
     v
@@ -5621,6 +5625,76 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
+    }
+    hr
+}
+
+/// Fence::GetCompletedValue. What the title's lists wrote into its sparse memory comes back
+/// asynchronously (`sparse::readback_after_execute`): the copies back the value covers land first.
+unsafe extern "system" fn fence_get_completed_value(this: *mut c_void) -> u64 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, slot_of(this, "GetCompletedValue")));
+    let v = f(this);
+    super::sparse::settle_readbacks_try();
+    v
+}
+
+/// A `fence_set_event_on_completion` wait: the title's event, XCL's own event the fence sets, and
+/// the thread-pool wait on it (0 until registered)
+struct FenceWait {
+    own: *mut c_void,
+    title: *mut c_void,
+    wait: AtomicUsize,
+}
+
+unsafe extern "system" fn fence_wait_fired(ctx: *mut c_void, _timed_out: bool) {
+    use windows_sys::Win32::System::Threading::{SetEvent, UnregisterWaitEx};
+    let w = ctx as *mut FenceWait;
+    super::sparse::settle_readbacks_try();
+    SetEvent((*w).title);
+    let mut wh = (*w).wait.load(Ordering::Acquire);
+    while wh == 0 {
+        std::hint::spin_loop();
+        wh = (*w).wait.load(Ordering::Acquire);
+    }
+    // no completion event: the registration goes once this callback returns
+    UnregisterWaitEx(wh as *mut c_void, std::ptr::null_mut());
+    windows_sys::Win32::Foundation::CloseHandle((*w).own);
+    drop(Box::from_raw(w));
+}
+
+/// Fence::SetEventOnCompletion. Once copies back land asynchronously, the title's event is set
+/// after the fence is reached and the copies back it covers landed: the fence sets an event of
+/// XCL's own, and a thread-pool wait on that settles them and sets the title's. A null event
+/// (a blocking wait) settles them after it.
+unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value: u64, event: *mut c_void) -> HRESULT {
+    use windows_sys::Win32::System::Threading::{CreateEventW, RegisterWaitForSingleObject, UnregisterWaitEx, INFINITE, WT_EXECUTEONLYONCE};
+    let f: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "SetEventOnCompletion")));
+    if event.is_null() || !super::sparse::readbacks_async() {
+        let hr = f(this, value, event);
+        if event.is_null() {
+            super::sparse::settle_readbacks_try();
+        }
+        return hr;
+    }
+    let own = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+    if own.is_null() {
+        return f(this, value, event);
+    }
+    let w = Box::into_raw(Box::new(FenceWait { own, title: event, wait: AtomicUsize::new(0) }));
+    let mut wh = std::ptr::null_mut();
+    if RegisterWaitForSingleObject(&mut wh, own, Some(fence_wait_fired), w as *const c_void, INFINITE, WT_EXECUTEONLYONCE) == 0 {
+        windows_sys::Win32::Foundation::CloseHandle(own);
+        drop(Box::from_raw(w));
+        return f(this, value, event);
+    }
+    (*w).wait.store(wh as usize, Ordering::Release);
+    let hr = f(this, value, own);
+    if hr < 0 {
+        // the event will not be set: take the wait back (waiting for a running callback)
+        if UnregisterWaitEx(wh, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE) != 0 {
+            windows_sys::Win32::Foundation::CloseHandle(own);
+            drop(Box::from_raw(w));
+        }
     }
     hr
 }

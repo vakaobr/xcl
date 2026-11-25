@@ -3656,8 +3656,11 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
 
         // Submit 1: reads slot 0 -> in_a (sparse VRAM) + arg_table constant 77 (Window 3)
         record_and_run(1, true);
+        // the copy back of what the shader stored lands asynchronously: before a CPU read the
+        // title's lists are done for, XCL settles it (as in Map and the CPU memory waits);
         // a window the GPU has a copy of: what the shader stored comes back on request
         let gpu_wrote = || {
+            crate::hle::d3d12x::sparse::settle_readbacks();
             if u.shadowed() {
                 crate::hle::d3d12x::sparse::readback_now(out_buf, 256);
             }
