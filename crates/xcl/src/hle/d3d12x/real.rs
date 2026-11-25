@@ -634,6 +634,29 @@ pub unsafe fn orig_fn(this: *mut c_void, slot: usize) -> usize {
     *orig.add(slot)
 }
 
+/// The host's D3D12 is in no PE module (Apple's D3DMetal under CrossOver or the Game Porting
+/// Toolkit): set when the first such table is adopted (`class_for`), never cleared.
+static NATIVE_HOST: AtomicBool = AtomicBool::new(false);
+
+/// Whether the host's D3D12 is a native host's (`NATIVE_HOST`): an atomic read, for a Release.
+pub(super) fn native_host() -> bool {
+    let on = NATIVE_HOST.load(Ordering::Relaxed);
+    // (a test's own switch, read after the flag: on a native host the flag is set before any
+    // Release, so a thread of the host's never reads this thread-local)
+    #[cfg(test)]
+    let on = on || native_host_tests::FORCED.with(|f| f.get());
+    on
+}
+
+/// `class_for` met a native host's table: noted once, and the thread that lets held resources
+/// go is started now, on the adopting thread, not in a Release on a thread of the host's.
+fn note_native_host() {
+    if !NATIVE_HOST.swap(true, Ordering::Relaxed) {
+        super::late_release::start_thread();
+        crate::xlog_info!("D3D12.X: the host's D3D12 is in no PE module (a native host: D3DMetal) – a resource's last Release only hands it to the late-release thread");
+    }
+}
+
 fn module_of(addr: usize) -> usize {
     use windows_sys::Win32::System::LibraryLoader::{
         GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -721,6 +744,10 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
     if is_ext(v) {
         return;
     }
+    // Read the setting `res_release` needs here, on the thread adopting the object: D3DMetal
+    // releases the resources of an executed list on a thread of its own, which has no Wine TEB,
+    // and reading the environment there for the first time never returns.
+    super::late_release::init();
     let ext = class_for(obj, v, kind);
     *(obj as *mut usize) = ext;
 }
@@ -746,6 +773,10 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     }
     let public = iface.methods.len();
     let m0 = module_of(*ot);
+    // (D3D12 on Windows and vkd3d-proton under Wine are PE modules)
+    if m0 == 0 {
+        note_native_host();
+    }
     let mut scanned = 0;
     while scanned < public + MAX_SCAN && module_of(*ot.add(scanned)) == m0 {
         scanned += 1;
@@ -1673,38 +1704,52 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     } else {
         f(this)
     };
+    // On a native host (D3DMetal) a Release can come on a thread of the host's own (its queue
+    // thread, at submit) or from inside a call XCL makes with a lock of its own held: a kept
+    // last Release only goes into a ring of atomics there – no lock of XCL's, no fence, no
+    // allocation. `late_release`'s thread forgets what XCL keeps by the address and lets the
+    // object go. Elsewhere this is never taken.
+    if held && native_host() {
+        super::late_release::hand_over(this as usize);
+        return 0;
+    }
     if n == 0 {
-        if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
-            s.remove(&(this as usize));
-        }
-        if let Some(s) = SPARSE_READBACK.lock().unwrap().as_mut() {
-            s.remove(&(this as usize));
-        }
-        if let Some(s) = RESERVED.lock().unwrap().as_mut() {
-            s.remove(&(this as usize));
-        }
-        if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
-            m.remove(&(this as usize));
-        }
-        if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
-            m.remove(&(this as usize));
-        }
-        super::sparse::forget_buffer(this as usize);
-        super::vram::forget(this as usize);
-        super::title_textures::forget(this as usize);
-        let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
-        if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
-            if u.is_sparse(p) {
-                super::sparse::free(p);
-            } else {
-                u.free(p);
-            }
-        }
+        forget_released(this as usize);
     }
     if held {
         super::late_release::hold(this as usize);
     }
     n
+}
+
+/// A resource the title released for good: what XCL keeps by its address goes.
+pub(super) unsafe fn forget_released(this: usize) {
+    if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
+        s.remove(&this);
+    }
+    if let Some(s) = SPARSE_READBACK.lock().unwrap().as_mut() {
+        s.remove(&this);
+    }
+    if let Some(s) = RESERVED.lock().unwrap().as_mut() {
+        s.remove(&this);
+    }
+    if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
+        m.remove(&this);
+    }
+    if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
+        m.remove(&this);
+    }
+    super::sparse::forget_buffer(this);
+    super::vram::forget(this);
+    super::title_textures::forget(this);
+    let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&this));
+    if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
+        if u.is_sparse(p) {
+            super::sparse::free(p);
+        } else {
+            u.free(p);
+        }
+    }
 }
 
 /// A stand-in that is no driver object (`standin`) was released for good.
@@ -8905,3 +8950,116 @@ void main() {
     }
 }
 
+
+#[cfg(test)]
+mod native_host_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+    thread_local! {
+        /// `native_host` answers true on this thread (a test of the native host's Release on
+        /// any host)
+        pub(super) static FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    unsafe fn adopted_buffer(dev: &ID3D12Device) -> ID3D12Resource {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 4096,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut res: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut res).unwrap();
+        let res = res.unwrap();
+        adopt(res.as_raw(), Kind::Resource);
+        res
+    }
+
+    /// The host is a native one only when its tables are in no PE module: D3D12 on Windows (and
+    /// vkd3d-proton under Wine) keeps the Release it had.
+    #[test]
+    fn only_a_table_in_no_pe_module_makes_a_native_host() {
+        // this test's own code is in a PE module, memory from the heap is in none
+        assert_ne!(module_of(native_host as usize), 0);
+        let heap = Box::new(0usize);
+        assert_eq!(module_of(&*heap as *const usize as usize), 0);
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let res = adopted_buffer(&dev);
+            let first = orig_fn(res.as_raw(), 0);
+            if module_of(first) != 0 {
+                assert!(!NATIVE_HOST.load(Ordering::Relaxed), "a host in a PE module is no native host");
+                assert!(!native_host());
+            } else {
+                assert!(NATIVE_HOST.load(Ordering::Relaxed), "a host in no PE module is a native host");
+            }
+        }
+    }
+
+    /// On a native host a kept last Release takes none of XCL's locks: with the late-release
+    /// lock and the maps' locks held on another thread it returns at once, and the resource
+    /// is forgotten and let go by the next drain.
+    #[test]
+    fn a_kept_last_release_on_a_native_host_waits_for_no_lock() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            if !super::super::late_release::enabled() {
+                return crate::gpu::recomp::runner::skip_test("XCL_LATE_RELEASE=0");
+            }
+            let res = adopted_buffer(&dev);
+            let raw = res.as_raw() as usize;
+            UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw);
+
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let (free_tx, free_rx) = std::sync::mpsc::channel::<()>();
+            let locker = std::thread::spawn(move || {
+                let held = super::super::late_release::lock_held_for_test();
+                let maps = (
+                    UNMAPPABLE.lock().unwrap(),
+                    SPARSE_READBACK.lock().unwrap(),
+                    RESERVED.lock().unwrap(),
+                    BUFFER_DELTA.lock().unwrap(),
+                    TITLE_ADDRESS.lock().unwrap(),
+                    UMA_BUFFERS.lock().unwrap(),
+                );
+                locked_tx.send(()).unwrap();
+                let _ = free_rx.recv_timeout(Duration::from_secs(10));
+                drop(maps);
+                drop(held);
+            });
+            locked_rx.recv().unwrap();
+
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let releaser = std::thread::spawn(move || {
+                FORCED.with(|f| f.set(true));
+                let start = Instant::now();
+                drop(res);
+                done_tx.send(start.elapsed()).unwrap();
+            });
+            let waited = done_rx.recv_timeout(Duration::from_secs(3));
+            free_tx.send(()).unwrap();
+            locker.join().unwrap();
+            releaser.join().unwrap();
+            let waited = waited.expect("the last Release waited for a lock another thread held");
+            assert!(waited < Duration::from_secs(1), "the last Release took {waited:?}");
+
+            // a drain forgets it (this thread's or the late-release thread's)
+            let start = Instant::now();
+            while UNMAPPABLE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&raw)) {
+                assert!(start.elapsed() < Duration::from_secs(5), "not forgotten by a drain");
+                super::super::late_release::drain_known(true);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}

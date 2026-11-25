@@ -10,6 +10,7 @@
 //! signalled on every queue with work on it; the batch goes once all of them have passed it.
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -92,6 +93,16 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("XCL_LATE_RELEASE").is_ok_and(|v| v.trim() == "0"))
 }
 
+/// Force the one-time read of `XCL_LATE_RELEASE` on the calling (Wine) thread.
+///
+/// D3DMetal calls `Release` on adopted resources from a native thread of its own, which has
+/// no Wine TEB.  Reading the environment there for the first time never returns.  Calling
+/// this from `real::adopt` -- on the Wine thread that creates the object -- makes sure the
+/// `OnceLock` inside `enabled()` is already set before the host's thread can reach it.
+pub fn init() {
+    let _ = enabled();
+}
+
 /// how long a last `Release` itself waits for queues with nothing to do to say so
 const IDLE_WAIT: Duration = Duration::from_micros(300);
 
@@ -113,18 +124,119 @@ pub unsafe fn hold(res: usize) {
     // A thread of its own lets the held ones go: the title may release a resource and then
     // wait for its memory without another submit (an imported heap pins the pages under its
     // resources – unmapping them stood still while one was held "until the next submit").
+    start_thread();
+}
+
+/// The thread that lets held resources go. Started by the first `hold`, or on a native host
+/// when the device is adopted (`real::class_for`): a Release there starts no thread.
+pub(super) fn start_thread() {
     static THREAD: std::sync::Once = std::sync::Once::new();
     THREAD.call_once(|| {
         let _ = std::thread::Builder::new().name("xcl-late-release".into()).spawn(|| loop {
             std::thread::sleep(TICK);
             unsafe { drain_known(false) };
+            let kept = RING.kept.swap(0, Ordering::Relaxed);
+            if kept > 0 {
+                crate::xlog_warn!("D3D12.X: {kept} released resource(s) kept for good: the late-release ring was full");
+            }
         });
     });
+}
+
+/// Resources handed over by a last `Release` that may neither lock nor wait (`hand_over`): a
+/// ring of slots written with atomics alone. The indices only grow (a slot is `index % N`);
+/// a writer claims an index, then writes its slot; one reader at a time empties a slot before
+/// it moves the tail past it.
+struct Ring<const N: usize> {
+    slots: [AtomicUsize; N],
+    /// the next index to write
+    head: AtomicUsize,
+    /// the next index to read
+    tail: AtomicUsize,
+    /// one reader at a time (readers are XCL's threads; writers never take it)
+    reading: Mutex<()>,
+    /// resources kept for good because the ring was full (`hand_over`; logged by the thread here)
+    kept: AtomicUsize,
+}
+
+/// Room kept free for writers that pass the check in `Ring::push` at the same moment: with
+/// fewer than this many at once, a claimed index is never a slot the reader has not emptied.
+const RING_WRITERS: usize = 256;
+
+impl<const N: usize> Ring<N> {
+    const fn new() -> Self {
+        Self { slots: [const { AtomicUsize::new(0) }; N], head: AtomicUsize::new(0), tail: AtomicUsize::new(0), reading: Mutex::new(()), kept: AtomicUsize::new(0) }
+    }
+
+    /// Nothing but atomics: no lock, no allocation. False: no room.
+    fn push(&self, res: usize) -> bool {
+        debug_assert!(res != 0);
+        if self.head.load(Ordering::Acquire).wrapping_sub(self.tail.load(Ordering::Acquire)) >= N - RING_WRITERS {
+            return false;
+        }
+        let i = self.head.fetch_add(1, Ordering::AcqRel);
+        self.slots[i % N].store(res, Ordering::Release);
+        true
+    }
+
+    /// What was pushed so far, in order. An index claimed but not written yet ends the look:
+    /// it and those after it are taken the next time.
+    fn take(&self) -> Vec<usize> {
+        // (an empty ring – always, on a host that hands nothing over – is two loads)
+        if self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let _one = self.reading.lock().unwrap();
+        let mut out = Vec::new();
+        let mut i = self.tail.load(Ordering::Acquire);
+        while i != self.head.load(Ordering::Acquire) {
+            let res = self.slots[i % N].swap(0, Ordering::AcqRel);
+            if res == 0 {
+                break;
+            }
+            out.push(res);
+            i = i.wrapping_add(1);
+            self.tail.store(i, Ordering::Release);
+        }
+        out
+    }
+}
+
+/// The process's ring (16,384 slots, 128 KiB): a title releases thousands of resources a
+/// frame while it loads.
+static RING: Ring<{ 1 << 14 }> = Ring::new();
+
+/// `res`, an adopted resource the title released for good with one reference kept
+/// (`real::res_release` on a native host), is left to the thread here: what XCL keeps by its
+/// address is forgotten there (`real::forget_released`) and the object goes once the queues
+/// are past the work in flight. Nothing but atomics on the calling thread. With the ring full
+/// the reference is kept for good: the object is never let go, so its address never comes
+/// again and nothing XCL keeps by it can be wrong.
+pub(super) fn hand_over(res: usize) {
+    hand_over_to(&RING, res);
+}
+
+fn hand_over_to<const N: usize>(ring: &Ring<N>, res: usize) -> bool {
+    if ring.push(res) {
+        return true;
+    }
+    ring.kept.fetch_add(1, Ordering::Relaxed);
+    false
 }
 
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
 /// upload ones.
 pub unsafe fn drain_known(seal_now: bool) {
+    // what was handed over by Releases that must not wait: forgotten here, on a thread of
+    // XCL's or the title's, then held like any other (the object is still there, so its
+    // address cannot come again before it is forgotten)
+    let handed = RING.take();
+    if !handed.is_empty() {
+        for &res in &handed {
+            super::real::forget_released(res);
+        }
+        HELD.lock().unwrap().get_or_insert_with(Held::default).open.extend(handed);
+    }
     if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
         return;
     }
@@ -146,6 +258,12 @@ pub unsafe fn drain_known(seal_now: bool) {
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
         f(res as *mut c_void);
     }
+}
+
+/// The lock of the held resources, for a test that shows a Release does not wait for it.
+#[cfg(test)]
+pub(super) fn lock_held_for_test() -> impl Sized {
+    HELD.lock().unwrap()
 }
 
 #[cfg(test)]
@@ -207,5 +325,93 @@ mod tests {
         held.open.push(0x1000);
         assert_eq!(unsafe { held.drain(&[], false) }, vec![0x1000]);
         assert!(held.is_empty());
+    }
+
+    /// The ring gives back what was handed over, in order, once, and is empty after.
+    #[test]
+    fn the_ring_gives_back_what_was_handed_over_in_order() {
+        let ring: Ring<1024> = Ring::new();
+        assert!(ring.take().is_empty());
+        for r in 1..=100 {
+            assert!(hand_over_to(&ring, r * 0x1000));
+        }
+        assert_eq!(ring.take(), (1..=100).map(|r| r * 0x1000).collect::<Vec<_>>());
+        assert!(ring.take().is_empty());
+        // the indices go on past the end of the slots
+        for round in 0..20 {
+            for r in 1..=100 {
+                assert!(hand_over_to(&ring, round * 0x10_0000 + r));
+            }
+            assert_eq!(ring.take().len(), 100);
+        }
+        assert_eq!(ring.kept.load(Ordering::Relaxed), 0);
+    }
+
+    /// A full ring refuses at once: the resource is counted as kept (its reference is never
+    /// given back, so nothing waits and its address never comes again), and the ring takes
+    /// resources again once it has been read.
+    #[test]
+    fn a_full_ring_keeps_the_resource_and_does_not_wait() {
+        let ring: Ring<512> = Ring::new();
+        let room = 512 - RING_WRITERS;
+        for r in 1..=room {
+            assert!(hand_over_to(&ring, r), "room for {room}, refused at {r}");
+        }
+        let start = Instant::now();
+        assert!(!hand_over_to(&ring, 0xdead), "a full ring refuses");
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert_eq!(ring.kept.load(Ordering::Relaxed), 1);
+        let got = ring.take();
+        assert_eq!(got.len(), room);
+        assert!(!got.contains(&0xdead), "the kept one is not handed over");
+        assert!(hand_over_to(&ring, 0xbeef));
+        assert_eq!(ring.take(), vec![0xbeef]);
+    }
+
+    /// Writers on several threads against readers on others: every resource comes out once.
+    #[test]
+    fn writers_and_readers_at_once_lose_nothing_and_take_nothing_twice() {
+        const WRITERS: usize = 4;
+        const EACH: usize = 50_000;
+        let ring: &'static Ring<1024> = Box::leak(Box::new(Ring::new()));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                std::thread::spawn(move || {
+                    for k in 0..EACH {
+                        let res = (w + 1) << 32 | (k + 1);
+                        while !ring.push(res) {
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    let mut got = Vec::new();
+                    loop {
+                        let last = done.load(Ordering::Acquire);
+                        got.extend(ring.take());
+                        if last {
+                            break got;
+                        }
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        done.store(true, Ordering::Release);
+        let mut all: Vec<usize> = readers.into_iter().flat_map(|r| r.join().unwrap()).collect();
+        all.extend(ring.take());
+        assert_eq!(all.len(), WRITERS * EACH, "every resource once");
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), WRITERS * EACH, "none twice");
     }
 }
