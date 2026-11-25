@@ -548,9 +548,7 @@ impl Em {
             }
         }
         self.dynamic_f16_rm = writes_nonzero_dp && self.has_f16_round_op && !self.has_f64_round_op;
-        self.safe_barrier = has_s_barrier
-            && self.compute_or_mesh_hw_waves().is_some_and(|w| w > 1)
-            && std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0");
+        self.safe_barrier = has_s_barrier && self.compute_or_mesh_hw_waves().is_some_and(|w| w > 1) && safe_barrier_enabled();
     }
 
     pub fn take(&mut self) -> String {
@@ -5486,6 +5484,19 @@ uint2 xcl_x_ballot_local(bool b) {
 // DPP16, DPP8, ds_swizzle, v_permlane(x)16: the ISA keeps the source in the reader's half
 uint xcl_x_rla_half(uint v, uint l) { return WaveReadLaneAt(v, l & 31u); }
 "#;
+
+/// Whether multi-wave Compute / Mesh `s_barrier`s become `xcl_s_barrier` (`PRELUDE_SAFE_BARRIER`):
+/// `XCL_SAFE_BARRIER=0` / `1` decides; by default yes, except on a Mac (`util::mac_host`:
+/// D3DMetal). There the waves spinning in it starve the waves they wait for (a 1024-thread
+/// group: a waiting wave's loop ran about 0.1 ms per iteration) until the spin gives up and the
+/// barrier lets them read LDS too early (#258), while Metal's group barrier does not wait for
+/// simdgroups that have exited (`gpu_safe_s_barrier_multi_warp_and_early_endpgm` passes with it).
+pub(crate) fn safe_barrier_enabled() -> bool {
+    match std::env::var("XCL_SAFE_BARRIER") {
+        Ok(v) => v.trim() != "0",
+        Err(_) => !crate::util::mac_host(),
+    }
+}
 
 /// Early-exit-safe, bounded workgroup barrier for multi-warp Compute / Mesh `s_barrier`.
 ///
