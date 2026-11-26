@@ -610,6 +610,13 @@ mod tests {
             }
             std::ptr::write_volatile(page(0) as *mut u8, 1);
             std::ptr::write_volatile(page(1) as *mut u8, 1);
+            // (a host whose kernel does not say which pages are in the working set – Wine on
+            // macOS – answers everything by the region walk: nothing to test of the shortcut)
+            if !resident_and_readable(page(0), page(2)) && crate::util::mac_host() {
+                assert!(readable(page(0), 2 << 12) && !readable(page(1), 2 << 12));
+                VirtualFree(base as *mut _, 0, MEM_RELEASE);
+                return crate::gpu::recomp::runner::skip_test("this host reports no working set");
+            }
             // written pages: answered from the working set
             assert!(resident_and_readable(page(0), page(2)));
             assert!(readable(page(0), 2 << 12));
