@@ -1423,46 +1423,114 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
 }
 
 /// S# built from constants in the code – how the console compiler places the static
-/// samplers of a root signature: for each MIMG instruction whose four sampler SGPRs were all
-/// set by s_mov / s_movk / s_brev with constants earlier in its block, those words.
-pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
-    let mut known: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-    let mut out = BTreeMap::new();
-    for d in insts {
-        if leaders.contains(&d.pc) {
-            known.clear();
-        }
-        let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);
-        if d.enc.name == "ENC_MIMG" {
-            if let Some(s) = f("SSAMP").map(|v| v * rdna2::register_scale("SSAMP")) {
-                if let (Some(a), Some(b), Some(c), Some(e)) = (known.get(&s), known.get(&(s + 1)), known.get(&(s + 2)), known.get(&(s + 3))) {
-                    out.insert(d.pc, [*a, *b, *c, *e]);
+/// samplers of a root signature: for each MIMG instruction whose four sampler SGPRs hold
+/// constants set by s_mov / s_movk / s_brev on every path that reaches it, those words.
+///
+/// The constants are followed through the program's branches (the compiler sets an S# before a
+/// loop or an `if` and samples inside it): a register is a constant at a block's start when
+/// every block that leads there leaves it with the same one. A program with a branch whose
+/// target is not known is read block by block, as nothing is known at a block's start then.
+///
+/// `follow`: the stages that draw (vertex and pixel programs). The other programs are read
+/// block by block as before: on a retail title, compute programs read this way gave garbage
+/// counts to `ExecuteIndirect` (2 055 in 75 s, none before) and the device hung.
+pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool) -> BTreeMap<u64, [u32; 4]> {
+    type Known = std::collections::HashMap<u64, u32>;
+    // one block's instructions on `known`; the S# of its MIMG instructions into `out`
+    fn run(block: &[Decoded], known: &mut Known, mut out: Option<&mut BTreeMap<u64, [u32; 4]>>) {
+        for d in block {
+            let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);
+            if d.enc.name == "ENC_MIMG" {
+                if let (Some(out), Some(s)) = (out.as_deref_mut(), f("SSAMP").map(|v| v * rdna2::register_scale("SSAMP"))) {
+                    if let (Some(a), Some(b), Some(c), Some(e)) = (known.get(&s), known.get(&(s + 1)), known.get(&(s + 2)), known.get(&(s + 3))) {
+                        out.insert(d.pc, [*a, *b, *c, *e]);
+                    }
                 }
             }
-        }
-        let set: Vec<(u64, u32)> = match d.inst.name {
-            "S_MOV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v)]).unwrap_or_default(),
-            "S_MOVK_I32" => f("SDST").zip(f("SIMM16")).map(|(r, v)| vec![(r, v as u16 as i16 as i32 as u32)]).unwrap_or_default(),
-            // a constant with only high bits set, as the compiler writes it: `s_brev_b32 s66, 40`
-            "S_BREV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v.reverse_bits())]).unwrap_or_default(),
-            // 64-bit moves of inline integers (sign-extended): S# words that are 0 / -1
-            "S_MOV_B64" => match (f("SDST"), f("SSRC0")) {
-                (Some(r), Some(c @ 128..=208)) => {
-                    let v = scalar_constant(d, c).unwrap() as i32 as i64;
-                    vec![(r, v as u32), (r + 1, (v >> 32) as u32)]
-                }
+            let set: Vec<(u64, u32)> = match d.inst.name {
+                "S_MOV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v)]).unwrap_or_default(),
+                "S_MOVK_I32" => f("SDST").zip(f("SIMM16")).map(|(r, v)| vec![(r, v as u16 as i16 as i32 as u32)]).unwrap_or_default(),
+                // a constant with only high bits set, as the compiler writes it: `s_brev_b32 s66, 40`
+                "S_BREV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v.reverse_bits())]).unwrap_or_default(),
+                // 64-bit moves of inline integers (sign-extended): S# words that are 0 / -1
+                "S_MOV_B64" => match (f("SDST"), f("SSRC0")) {
+                    (Some(r), Some(c @ 128..=208)) => {
+                        let v = scalar_constant(d, c).unwrap() as i32 as i64;
+                        vec![(r, v as u32), (r + 1, (v >> 32) as u32)]
+                    }
+                    _ => Vec::new(),
+                },
                 _ => Vec::new(),
-            },
-            _ => Vec::new(),
-        };
-        for w in rdna2::sgpr_uses(d).1 {
-            known.remove(&w);
-        }
-        for (r, v) in set {
-            if r < 106 {
-                known.insert(r, v);
+            };
+            for w in rdna2::sgpr_uses(d).1 {
+                known.remove(&w);
+            }
+            for (r, v) in set {
+                if r < 106 {
+                    known.insert(r, v);
+                }
             }
         }
+    }
+    // the blocks, in address order
+    let mut starts: Vec<usize> = insts.iter().enumerate().filter(|(i, d)| *i == 0 || leaders.contains(&d.pc)).map(|(i, _)| i).collect();
+    starts.push(insts.len());
+    let blocks: Vec<&[Decoded]> = starts.windows(2).map(|w| &insts[w[0]..w[1]]).filter(|b| !b.is_empty()).collect();
+    let at: std::collections::HashMap<u64, usize> = blocks.iter().enumerate().map(|(k, b)| (b[0].pc, k)).collect();
+    // where each block goes on; None: somewhere that is not known
+    let next: Option<Vec<Vec<usize>>> = blocks
+        .iter()
+        .enumerate()
+        .map(|(k, b)| {
+            let d = b.last().unwrap();
+            let after = (k + 1 < blocks.len()).then_some(k + 1);
+            Some(match (rdna2::branch_target(d), d.inst.name) {
+                (Some(t), n) if n.starts_with("S_CBRANCH") => after.into_iter().chain([*at.get(&t)?]).collect(),
+                (Some(t), "S_BRANCH" | "S_SETPC_B64") => vec![*at.get(&t)?],
+                (Some(_), _) => return None,
+                (None, "S_ENDPGM") => Vec::new(),
+                (None, _) if d.inst.flags & rdna2::F_TERMINATOR != 0 => return None,
+                _ => after.into_iter().collect(),
+            })
+        })
+        .collect();
+    let mut out = BTreeMap::new();
+    let Some(next) = next.filter(|_| follow) else {
+        for b in &blocks {
+            run(b, &mut Known::new(), Some(&mut out));
+        }
+        return out;
+    };
+    // what is known at each block's start (None: not reached yet): what every way in agrees on
+    let mut start: Vec<Option<Known>> = vec![None; blocks.len()];
+    let mut work: Vec<usize> = Vec::new();
+    if !blocks.is_empty() {
+        start[0] = Some(Known::new());
+        work.push(0);
+    }
+    while let Some(k) = work.pop() {
+        let mut known = start[k].clone().unwrap_or_default();
+        run(blocks[k], &mut known, None);
+        for &n in &next[k] {
+            let changed = match &mut start[n] {
+                slot @ None => {
+                    *slot = Some(known.clone());
+                    true
+                }
+                Some(have) => {
+                    let before = have.len();
+                    have.retain(|r, v| known.get(r) == Some(v));
+                    have.len() != before
+                }
+            };
+            if changed {
+                work.push(n);
+            }
+        }
+    }
+    for (k, b) in blocks.iter().enumerate() {
+        // (a block nothing leads to: nothing known at its start)
+        run(b, &mut start[k].clone().unwrap_or_default(), Some(&mut out));
     }
     out
 }
@@ -1547,7 +1615,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let mut em = emit::Em::new(opt.clone());
     em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
-    em.static_ss = constant_samplers(&insts, &leaders);
+    em.static_ss = constant_samplers(&insts, &leaders, matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)));
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
     // skip the quad reads that give the helper lanes' bits

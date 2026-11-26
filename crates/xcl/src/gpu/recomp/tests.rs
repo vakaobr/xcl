@@ -3138,6 +3138,53 @@ fn static_sampler_word_from_s_brev_is_a_constant() {
     assert!(!t.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookup left");
 }
 
+/// An S# set before a branch and sampled after it (the compiler sets the S# of a blur's taps
+/// before the loop, of an effect before its `if`) is a static sampler all the same: the
+/// constants are followed into the next block. Before, a block's start forgot them and the
+/// shader sampled through sampler-heap entry 0 (point, wrap, mip 0).
+#[test]
+fn static_sampler_set_before_a_branch_is_a_constant_after_it() {
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let linear = [clamp, 0x00FF_F000u32, 0x0050_0000u32, 0];
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 255)], Some(linear[0])),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 25), ("SSRC0", 255)], Some(linear[1])),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 255)], Some(linear[2])),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 27), ("SSRC0", 128)], None),
+        // (both ways go to the next instruction: it starts a block)
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None),
+    ]);
+    let pixel = Options { mode: Mode::Pixel(crate::gpu::recomp::PsInterface::default()), ..Default::default() };
+    let t = translate(&code, &pixel).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert_eq!(t.static_samplers, vec![(linear, false)], "the S# set before the branch is a static sampler");
+    assert!(!t.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookup left");
+    // a program that does not draw is read block by block, as before
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.static_samplers.is_empty(), "{:?}", t.static_samplers);
+}
+
+/// Two ways into a block that leave different words in an S# register: not a constant there,
+/// the sampler is looked up as before.
+#[test]
+fn an_s_word_that_differs_by_the_way_in_is_no_constant() {
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 255)], Some(clamp)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 25), ("SSRC0", 255)], Some(0x00FF_F000)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 255)], Some(0x0050_0000)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 27), ("SSRC0", 128)], None),
+        // over the next move (two dwords): one way keeps the first s26, the other sets another
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 2)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 255)], Some(0)),
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None),
+    ]);
+    let pixel = Options { mode: Mode::Pixel(crate::gpu::recomp::PsInterface::default()), ..Default::default() };
+    let t = translate(&code, &pixel).unwrap();
+    assert!(t.static_samplers.is_empty(), "{:?}", t.static_samplers);
+}
+
 /// The same program on the GPU: the texel a point sampler picks at a texel boundary.
 #[test]
 fn gpu_static_sampler_word_from_s_brev() {
