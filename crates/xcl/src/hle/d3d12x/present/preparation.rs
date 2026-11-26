@@ -55,7 +55,13 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
     } else { None };
     let result = std::thread::scope(|scope| {
         let worker = scope.spawn(|| prepare_for_launch(root, &progress));
+        // (a line every 5 s: a log that stands still for long reads as a frozen process)
+        let (began, mut said) = (Instant::now(), Instant::now());
         while !worker.is_finished() {
+            if said.elapsed() >= Duration::from_secs(5) {
+                said = Instant::now();
+                crate::xlog_info!("Shader preparation: {} of {} steps after {} s", progress.done.load(Ordering::Relaxed), progress.total.load(Ordering::Relaxed), began.elapsed().as_secs());
+            }
             if let Some(parent) = &parent {
                 if unsafe { WaitForSingleObject(parent.as_raw_handle(), 80) } == WAIT_OBJECT_0 {
                     // The launcher was stopped during preparation. Do not leave an orphan compile or start the title.
