@@ -1606,6 +1606,9 @@ pub(crate) struct LaunchPreparation {
     pub done: AtomicUsize,
     pub total: AtomicUsize,
     pub cancel: std::sync::atomic::AtomicBool,
+    /// The worker processes building compute pipelines (0: none; `done` and `total` then count
+    /// the records translated here, with them the records the workers have passed).
+    pub workers: AtomicUsize,
 }
 
 /// Unpacked shader containers in the title's shaders directory. Do not follow directory
@@ -1652,7 +1655,6 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
         // about two pipelines at a time for one process, whatever the processors)
         if workers > 1 && matches!(input, Input::Pack { .. }) {
             let n = input.len();
-            progress.total.fetch_add(n, Ordering::Relaxed);
             precompile(&input, usize::MAX, windows, None, None, false, None, std::time::Instant::now(), Some(progress))?;
             if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
             pipelines_in_workers(&pack, windows, workers, n, progress)?;
@@ -1664,7 +1666,7 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
 }
 
 /// `XCL_PREPARE_WORKERS`: the processes that build a pack's compute pipelines before a title
-/// starts (1: in this process, as before). Unset: the processors less two, 16 at most, and no
+/// starts (1: in this process, as before). Unset: the logical processors less four, and no
 /// more than 3 GB of the commit the system has left for each.
 fn prepare_workers() -> usize {
     if let Some(n) = std::env::var("XCL_PREPARE_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()) {
@@ -1675,9 +1677,9 @@ fn prepare_workers() -> usize {
     workers_for(cores, limit.saturating_sub(used))
 }
 
-/// The workers for `cores` processors and `free_mb` of commit left.
+/// The workers for `cores` logical processors (threads, not cores) and `free_mb` of commit left.
 fn workers_for(cores: usize, free_mb: u64) -> usize {
-    cores.saturating_sub(2).min(16).min((free_mb / 3072) as usize).max(1)
+    cores.saturating_sub(4).min(32).min((free_mb / 3072) as usize).max(1)
 }
 
 /// The record count of a builder's progress line (`  400/26503 (12 s)`).
@@ -1700,7 +1702,11 @@ fn pipelines_in_workers(pack: &Path, windows: u32, workers: usize, records: usiz
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let used_only = !crate::hle::d3d12x::pso_async::earlier_used_keys().is_empty();
-    let before = progress.done.load(Ordering::Relaxed);
+    // the workers' pass has its own count on the screen: the records they have passed
+    let (done_before, total_before) = (progress.done.load(Ordering::Relaxed), progress.total.load(Ordering::Relaxed));
+    progress.done.store(0, Ordering::Relaxed);
+    progress.total.store(records, Ordering::Relaxed);
+    progress.workers.store(workers, Ordering::Relaxed);
     let counts: Vec<AtomicUsize> = (0..workers).map(|_| AtomicUsize::new(0)).collect();
     let t0 = std::time::Instant::now();
     crate::xlog_info!("Shader preparation: compute pipelines in {workers} worker processes{}", if used_only { ", those an earlier run used" } else { "" });
@@ -1739,7 +1745,7 @@ fn pipelines_in_workers(pack: &Path, windows: u32, workers: usize, records: usiz
         loop {
             // (a worker counts the records of its own slice)
             let d: usize = counts.iter().map(|c| c.load(Ordering::Relaxed)).sum();
-            progress.done.store(before + d.min(records), Ordering::Relaxed);
+            progress.done.store(d.min(records), Ordering::Relaxed);
             if progress.cancel.load(Ordering::Relaxed) {
                 for (_, child) in children.iter_mut() { let _ = child.kill(); }
                 return true;
@@ -1756,8 +1762,10 @@ fn pipelines_in_workers(pack: &Path, windows: u32, workers: usize, records: usiz
             Err(e) => { failed += 1; crate::xlog_warn!("Shader preparation: worker {i}: {e}"); }
         }
     }
+    progress.workers.store(0, Ordering::Relaxed);
+    progress.total.store(total_before, Ordering::Relaxed);
+    progress.done.store(done_before, Ordering::Relaxed);
     if cancelled { return Err("Shader preparation cancelled".into()); }
-    progress.done.store(before + records, Ordering::Relaxed);
     crate::xlog_info!("Shader preparation: compute pipelines done in {:.0} s ({failed} of {workers} workers failed)", t0.elapsed().as_secs_f64());
     Ok(())
 }
@@ -2311,14 +2319,15 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
 
 #[cfg(test)]
 mod tests {
-    /// The workers of a title's shader preparation: two processors are left free, 16 at most,
+    /// The workers of a title's shader preparation: four logical processors are left free,
     /// 3 GB of commit for each, and one where there is no room.
     #[test]
     fn preparation_workers_leave_two_processors_and_follow_the_commit_left() {
-        assert_eq!(workers_for(32, 100_000), 16);
-        assert_eq!(workers_for(8, 100_000), 6);
+        assert_eq!(workers_for(32, 100_000), 28);
+        assert_eq!(workers_for(8, 100_000), 4);
         assert_eq!(workers_for(32, 10_000), 3);
         assert_eq!(workers_for(2, 100_000), 1);
+        assert_eq!(workers_for(64, 1_000_000), 32);
         assert_eq!(workers_for(32, 0), 1);
     }
 
