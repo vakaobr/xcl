@@ -8561,7 +8561,9 @@ mod console_format_query_tests {
             let hr = dev_create_placed_resource_x(dev.as_raw(), heap.as_raw() as usize, 0, x.as_ptr() as usize, state, &clear as *const _ as usize, riid, &mut p);
             assert!(hr >= 0 && !p.is_null(), "D16S8 target with a 118 clear value: {hr:#x}");
             let r = ID3D12Resource::from_raw(p);
-            assert_eq!(r.GetDesc().Format.0, 44, "made R24G8_TYPELESS");
+            // (R32_TYPELESS where every depth + stencil family is depth only: a native host)
+            let want = if crate::hle::d3d12x::device_x::depth_only() { 39 } else { 44 };
+            assert_eq!(r.GetDesc().Format.0, want, "made R24G8_TYPELESS (R32_TYPELESS on a native host)");
         }
     }
 }

@@ -36,6 +36,9 @@ struct Fixture {
 fn fixture() -> Option<&'static Fixture> {
     static FIX: OnceLock<Option<Fixture>> = OnceLock::new();
     FIX.get_or_init(|| unsafe {
+        // (the PC's formats: on a native host – D3DMetal – XCL answers for a depth + stencil
+        // format with the depth-only one it makes, `device_x::depth_only`, tested there)
+        std::env::set_var("XCL_DEPTH_STENCIL", "1");
         let factory: IDXGIFactory6 = match CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) {
             Ok(f) => f,
             Err(_) => {
