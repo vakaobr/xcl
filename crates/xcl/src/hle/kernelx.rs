@@ -2529,6 +2529,10 @@ mod tests {
     #[test]
     fn mapping_fresh_pages_does_not_query_each_page() {
         const N: usize = 64;
+        // (it counts on pages left lazy: not on a Mac, `lazy::enabled`)
+        if !lazy::enabled() {
+            return crate::gpu::recomp::runner::skip_test("pages are committed when they are mapped on this host (XCL_LAZY_PAGES)");
+        }
         unsafe {
             let Some(u) = crate::gpu::uma::get() else { return };
             let mut n = N;
@@ -2646,6 +2650,10 @@ mod tests {
     #[test]
     fn mapping_lazy_pages_again_does_not_query_each_page() {
         const N: usize = 64;
+        // (it counts on pages left lazy: not on a Mac, `lazy::enabled`)
+        if !lazy::enabled() {
+            return crate::gpu::recomp::runner::skip_test("pages are committed when they are mapped on this host (XCL_LAZY_PAGES)");
+        }
         unsafe {
             let Some(mut pages) = sparse_pages(N) else { return };
             let r1 = mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;

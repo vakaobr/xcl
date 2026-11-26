@@ -1556,6 +1556,9 @@ mod tests {
 
         let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !kernelx::lazy::enabled() {
+            return crate::gpu::recomp::runner::skip_test("pages are committed when they are mapped on this host (XCL_LAZY_PAGES)");
+        }
         if super::super::backend() != super::super::Backend::Real {
             crate::gpu::recomp::runner::skip_test("no GPU");
             return;
