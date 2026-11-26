@@ -8,6 +8,20 @@ use crate::config::Boot;
 
 pub static HOST_MODE: AtomicBool = AtomicBool::new(false);
 
+/// The system's commit charge and its limit in bytes (RAM plus page files): what all programs'
+/// memory, and all video memory, is counted against. (0, 0): not known.
+pub fn system_commit() -> (u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
+    unsafe {
+        let mut p: PERFORMANCE_INFORMATION = std::mem::zeroed();
+        p.cb = std::mem::size_of_val(&p) as u32;
+        if K32GetPerformanceInfo(&mut p, p.cb) == 0 {
+            return (0, 0);
+        }
+        (p.CommitTotal as u64 * p.PageSize as u64, p.CommitLimit as u64 * p.PageSize as u64)
+    }
+}
+
 pub fn host_main(boot_path: &Path) -> i32 {
     let boot: Boot = match std::fs::read_to_string(boot_path).map_err(|e| e.to_string()).and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())) {
         Ok(b) => b,
@@ -155,4 +169,15 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::report::write_final(None);
     crate::log::flush();
     code as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_system_commit_is_known_and_under_its_limit() {
+        let (commit, limit) = system_commit();
+        assert!(commit > 0 && commit <= limit, "{commit} of {limit}");
+    }
 }
