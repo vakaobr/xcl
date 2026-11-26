@@ -1322,7 +1322,7 @@ fn tier2(dev: &ID3D12Device) -> bool {
 /// give a streamed texture memory level by level once `place_pages` says no – a retail title's
 /// loading was at 16.5 GB wired with the pages and 12.3 – 14.0 GB with the level tiles
 /// (shortside, #258).
-fn arenas() -> bool {
+pub(super) fn arenas() -> bool {
     match std::env::var("XCL_VRAM_ARENAS") {
         Ok(v) => !(crate::util::mac_host() && v.trim() == "0"),
         Err(_) => crate::util::mac_host(),

@@ -2004,6 +2004,9 @@ mod tests {
     fn placed_title_textures_share_vram_and_preserve_pixels() {
         let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if super::super::vram::arenas() {
+            return crate::gpu::recomp::runner::skip_test("title textures are not on shared pages on this host (XCL_VRAM_ARENAS)");
+        }
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
         use windows::Win32::Graphics::Dxgi::*;
