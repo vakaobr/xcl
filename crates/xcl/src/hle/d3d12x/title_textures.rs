@@ -1858,8 +1858,13 @@ mod tests {
                 std::ptr::write_bytes((base + (page << 12)) as *mut u8, 0xA0 + page as u8, 1 << 12);
             }
             let whole = title_bytes(base, 1 << 12);
-            assert!(matches!(whole, std::borrow::Cow::Borrowed(_)), "a committed page is not copied");
-            assert_eq!(whole.as_ptr() as usize, base);
+            if crate::util::mac_host() {
+                // (on a Mac every read is a copy that survives a page going: `guarded_copy`)
+                assert!(matches!(whole, std::borrow::Cow::Owned(_)), "on a Mac title memory is copied");
+            } else {
+                assert!(matches!(whole, std::borrow::Cow::Borrowed(_)), "a committed page is not copied");
+                assert_eq!(whole.as_ptr() as usize, base);
+            }
             assert!(whole.iter().all(|&b| b == 0xA0));
             let holed = title_bytes(base, 3 << 12);
             assert!(matches!(holed, std::borrow::Cow::Owned(_)), "a range with a reserved page is read");
