@@ -1695,14 +1695,25 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
 
 /// `XCL_PREPARE_WORKERS`: the processes that build a pack's compute pipelines before a title
 /// starts (1: in this process, as before). Unset: the logical processors less four, and no
-/// more than 3 GB of the commit the system has left for each.
+/// more than 3 GB of the commit the system has left for each; on a Mac, 1.
 fn prepare_workers() -> usize {
     if let Some(n) = std::env::var("XCL_PREPARE_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()) {
         return n.clamp(1, 32);
     }
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let (used, limit) = crate::host::system_commit();
-    workers_for_commit(cores, used, limit)
+    default_workers(crate::util::mac_host(), cores, used, limit)
+}
+
+/// `prepare_workers` when `XCL_PREPARE_WORKERS` is unset. On a Mac, 1: D3DMetal keeps the
+/// pipelines it compiles in `d3dm/<name>/shaders.cache/MTLGPUFamilyApple10_<n>`, where `<name>`
+/// is the exe on the process's command line (the title's for the host, `xcl.exe` for a worker)
+/// and `<n>` is one per process running at the same time. Worker processes build into a cache
+/// the title never opens; the host's own builds land in the title's. Measured on CrossOver 26.3
+/// with the test title: preparation in the host grew only `d3dm/xcl_testtitle.exe`, and a
+/// process alone rebuilt the half of a pack that a second process had built beside it.
+fn default_workers(mac: bool, cores: usize, used: u64, limit: u64) -> usize {
+    if mac { 1 } else { workers_for_commit(cores, used, limit) }
 }
 
 /// `workers_for` with the system's commit as `host::system_commit` gives it, in bytes.
@@ -2433,6 +2444,13 @@ mod tests {
         assert_eq!(workers_for_commit(18, 34 << 30, 55 << 30), 7);
         assert_eq!(workers_for_commit(32, 0, 100 << 30), 28);
         assert_eq!(workers_for_commit(32, 55 << 30, 55 << 30), 1);
+    }
+
+    /// On a Mac the pack is prepared in the title's process, whose D3DMetal cache the title reads.
+    #[test]
+    fn preparation_stays_in_the_title_process_on_a_mac() {
+        assert_eq!(default_workers(true, 18, 0, 55 << 30), 1);
+        assert_eq!(default_workers(false, 18, 0, 55 << 30), 14);
     }
 
     /// A builder's progress line gives its record count; its other lines give none.
