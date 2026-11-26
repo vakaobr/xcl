@@ -5621,6 +5621,11 @@ unsafe impl Send for OwnedDesc {}
 
 /// A hash of a pipeline's shaders in their order (never 0): what `pso_async` knows a used
 /// pipeline by in the next run.
+/// `shaders_key` of the one shader `blob`.
+pub(crate) fn shader_key(blob: &[u8]) -> u64 {
+    ((0xcbf2_9ce4_8422_2325u64 ^ crate::gpu::shader::fnv64(blob)).wrapping_mul(0x0000_0100_0000_01b3)) | 1
+}
+
 pub(crate) fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in blobs {
@@ -5631,6 +5636,13 @@ pub(crate) fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
 
 #[cfg(test)]
 mod shaders_key_tests {
+    #[test]
+    fn the_key_of_one_shader_is_the_key_of_a_set_of_it() {
+        let a = vec![1u8, 2, 3];
+        assert_eq!(super::shader_key(&a), super::shaders_key(&[a.clone()]));
+        assert_ne!(super::shader_key(&a), super::shader_key(&[4u8, 5]));
+    }
+
     #[test]
     fn a_key_follows_the_shaders_and_their_order_and_is_never_zero() {
         let (a, b) = (vec![1u8, 2, 3], vec![4u8, 5]);
@@ -5645,11 +5657,16 @@ mod shaders_key_tests {
 
 impl OwnedDesc {
     fn shaders_key(&self) -> u64 {
-        shaders_key(match self {
+        let blobs = match self {
             OwnedDesc::Compute(_, b) => b,
             OwnedDesc::Graphics(_, b, ..) => b,
             OwnedDesc::Stream(_, _, b) => b,
-        })
+        };
+        let key = shaders_key(blobs);
+        // each shader by itself too: what a title's shader preparation translates before the
+        // next run (`pso_async::earlier_used_shaders`)
+        super::pso_async::shaders_of(key, blobs.iter().map(|b| shader_key(b)).collect());
+        key
     }
 
     fn ptr(&self) -> *const c_void {

@@ -1609,6 +1609,10 @@ pub(crate) struct LaunchPreparation {
     /// The worker processes building compute pipelines (0: none; `done` and `total` then count
     /// the records translated here, with them the records the workers have passed).
     pub workers: AtomicUsize,
+    /// The shaders earlier runs used (`pso_async::earlier_used_shaders`), when there are any:
+    /// only their records are translated before the title starts, and it translates another
+    /// when it first uses it. `XCL_PREPARE_ALL=1`: every record, as without the list.
+    pub only: Option<HashSet<u64>>,
 }
 
 /// Unpacked shader containers in the title's shaders directory. Do not follow directory
@@ -1866,6 +1870,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     continue;
                 };
                 if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
+                    record_done();
+                    continue;
+                }
+                if startup.and_then(|p| p.only.as_ref()).is_some_and(|used| !used.contains(&crate::hle::d3d12x::real::shader_key(&blob))) {
+                    unused.fetch_add(1, Ordering::Relaxed);
                     record_done();
                     continue;
                 }

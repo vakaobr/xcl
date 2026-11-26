@@ -416,6 +416,18 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     }
 }
 
+/// The shaders of a pipeline's set, told when the set's key is made (`real::OwnedDesc`).
+pub(crate) fn shaders_of(key: u64, shaders: Vec<u64>) {
+    used::parts(key, shaders);
+}
+
+/// The shaders of the pipelines earlier runs used, each by its own key (`used-shaders.txt`
+/// beside the DXIL cache): what a title's shader preparation translates. Empty before a run
+/// with this list has used a pipeline.
+pub fn earlier_used_shaders() -> std::collections::HashSet<u64> {
+    used::parse(&std::fs::read_to_string(crate::gpu::recomp::dxc::cache_dir().join("used-shaders.txt")).unwrap_or_default())
+}
+
 /// The keys of the pipelines earlier runs used (`used-pipelines.txt` beside the DXIL cache):
 /// what `xcl shaders --precompile --used-only` builds.
 pub fn earlier_used_keys() -> std::collections::HashSet<u64> {
@@ -439,6 +451,10 @@ mod used {
     struct Used {
         earlier: RwLock<HashSet<u64>>,
         now: Mutex<(HashSet<u64>, Option<std::fs::File>)>,
+        /// the shaders of each set made in this run, by the set's key; the shaders of the sets
+        /// used so far and `used-shaders.txt`, where they are kept for the next run
+        parts: Mutex<std::collections::HashMap<u64, Vec<u64>>>,
+        shaders: Mutex<(HashSet<u64>, Option<std::fs::File>)>,
     }
 
     /// The keys in a `used-pipelines.txt` (lines that are not a hexadecimal key are passed over).
@@ -451,7 +467,7 @@ mod used {
         U.get_or_init(|| {
             // (a test neither reads nor writes the user's file)
             if cfg!(test) {
-                return Used { earlier: RwLock::new(HashSet::new()), now: Mutex::new((HashSet::new(), None)) };
+                return Used { earlier: RwLock::new(HashSet::new()), now: Mutex::new((HashSet::new(), None)), parts: Default::default(), shaders: Mutex::new((HashSet::new(), None)) };
             }
             let path = crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt");
             let earlier = parse(&std::fs::read_to_string(&path).unwrap_or_default());
@@ -462,7 +478,10 @@ mod used {
                 let _ = std::fs::create_dir_all(dir);
             }
             let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
-            Used { now: Mutex::new((earlier.clone(), file)), earlier: RwLock::new(earlier) }
+            let shaders_path = path.with_file_name("used-shaders.txt");
+            let shaders = parse(&std::fs::read_to_string(&shaders_path).unwrap_or_default());
+            let shaders_file = std::fs::OpenOptions::new().create(true).append(true).open(&shaders_path).ok();
+            Used { now: Mutex::new((earlier.clone(), file)), earlier: RwLock::new(earlier), parts: Default::default(), shaders: Mutex::new((shaders, shaders_file)) }
         })
     }
 
@@ -476,12 +495,38 @@ mod used {
         if key == 0 {
             return;
         }
-        let mut g = get().now.lock().unwrap();
-        if g.0.insert(key) {
-            if let Some(f) = g.1.as_mut() {
-                let _ = writeln!(f, "{key:016x}");
+        {
+            let mut g = get().now.lock().unwrap();
+            if g.0.insert(key) {
+                if let Some(f) = g.1.as_mut() {
+                    let _ = writeln!(f, "{key:016x}");
+                }
             }
         }
+        // its shaders, each once (also those of a set an earlier run used: the list of
+        // shaders is younger than the list of sets)
+        let parts = get().parts.lock().unwrap().get(&key).cloned().unwrap_or_default();
+        let mut g = get().shaders.lock().unwrap();
+        for part in parts {
+            if g.0.insert(part) {
+                if let Some(f) = g.1.as_mut() {
+                    let _ = writeln!(f, "{part:016x}");
+                }
+            }
+        }
+    }
+
+    /// The shaders of the set `key`, each by its own key (`real::shader_key`).
+    pub fn parts(key: u64, shaders: Vec<u64>) {
+        if key != 0 {
+            get().parts.lock().unwrap().entry(key).or_insert(shaders);
+        }
+    }
+
+    /// (tests) This run used the shader `key`.
+    #[cfg(test)]
+    pub fn shader_noted(key: u64) -> bool {
+        get().shaders.lock().unwrap().0.contains(&key)
     }
 
     /// (tests) This run used a pipeline of these shaders.
@@ -559,6 +604,20 @@ fn preload() -> Option<&'static Preload> {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    /// The shaders of a set are kept when a pipeline of the set is used, each once, and not
+    /// before: a set that is only made keeps nothing.
+    #[test]
+    fn the_shaders_of_a_used_set_are_kept_for_the_next_run() {
+        let (set, other) = (0x5e70_0000_0000_0001u64, 0x5e70_0000_0000_0003u64);
+        let (vs, ps, cs) = (0x5e70_0000_0000_0011u64, 0x5e70_0000_0000_0013u64, 0x5e70_0000_0000_0015u64);
+        shaders_of(set, vec![vs, ps]);
+        shaders_of(other, vec![cs]);
+        assert!(!used::shader_noted(vs) && !used::shader_noted(ps), "made, not used yet");
+        used::note(set);
+        assert!(used::shader_noted(vs) && used::shader_noted(ps), "the shaders of the used set");
+        assert!(!used::shader_noted(cs), "the other set was not used");
+    }
 
     /// A PC call that has kept one of the title's threads for long holds the title, a short one
     /// does not, and the hold ends with the call.
