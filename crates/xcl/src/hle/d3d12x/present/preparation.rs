@@ -1,5 +1,5 @@
 //! Pre-entry shader preparation in the same HWND that later owns the DXGI swap chain.
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -32,13 +32,9 @@ impl Screen {
 
 pub(super) fn active() -> bool { ACTIVE.load(Ordering::Acquire) }
 
-pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
-    // This handle was opened by the launcher on itself, then inherited by this host.
-    let parent = std::env::var("XCL_PREPARATION_PARENT").ok()
-        .and_then(|s| s.parse::<usize>().ok()).filter(|&h| h != 0)
-        .map(|h| unsafe { OwnedHandle::from_raw_handle(h as _) });
+/// `parent`: the launcher (`host::launcher_handle`); preparation stops when it is gone.
+pub(crate) fn before_guest(boot: &Boot, parent: Option<&OwnedHandle>) -> Result<(), String> {
     let menu = std::env::var_os("XCL_PREPARATION_MENU").is_some();
-    std::env::remove_var("XCL_PREPARATION_PARENT");
     std::env::remove_var("XCL_PREPARATION_MENU");
     let root = &boot.game_root;
     if boot.config.graphics.eq_ignore_ascii_case("null") ||
@@ -80,7 +76,7 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
                     began.elapsed().as_secs()
                 );
             }
-            if let Some(parent) = &parent {
+            if let Some(parent) = parent {
                 if unsafe { WaitForSingleObject(parent.as_raw_handle(), 80) } == WAIT_OBJECT_0 {
                     // The launcher was stopped during preparation. Do not leave an orphan compile or start the title.
                     std::process::exit(2);

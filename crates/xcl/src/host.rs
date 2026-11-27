@@ -22,6 +22,32 @@ pub fn system_commit() -> (u64, u64) {
     }
 }
 
+/// The host's exit code when it ended because its launcher was gone.
+const LAUNCHER_GONE: u32 = 0x7C1_0003;
+
+/// The launcher, by a synchronize-only handle it opened on itself and this host inherited
+/// (`XCL_PREPARATION_PARENT`; None: started some other way).
+fn launcher_handle() -> Option<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::FromRawHandle;
+    let h = std::env::var("XCL_PREPARATION_PARENT").ok().and_then(|s| s.parse::<usize>().ok()).filter(|&h| h != 0);
+    std::env::remove_var("XCL_PREPARATION_PARENT");
+    // SAFETY: the launcher put an inherited handle's value there for this process alone
+    h.map(|h| unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(h as _) })
+}
+
+/// `gone` runs once `launcher` is signalled: the launcher ended (killed, or its console closed)
+/// and nobody waits for this process, reads its output or summarizes the run any more.
+fn watch_launcher(launcher: std::os::windows::io::OwnedHandle, gone: impl FnOnce() + Send + 'static) -> std::io::Result<std::thread::JoinHandle<()>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    std::thread::Builder::new().name("xcl-launcher-watch".into()).spawn(move || {
+        if unsafe { WaitForSingleObject(launcher.as_raw_handle(), INFINITE) } == WAIT_OBJECT_0 {
+            gone();
+        }
+    })
+}
+
 pub fn host_main(boot_path: &Path) -> i32 {
     let boot: Boot = match std::fs::read_to_string(boot_path).map_err(|e| e.to_string()).and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())) {
         Ok(b) => b,
@@ -50,10 +76,20 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
-    if let Err(e) = crate::hle::d3d12x::present::preparation::before_guest(&boot) {
+    let launcher = launcher_handle();
+    if let Err(e) = crate::hle::d3d12x::present::preparation::before_guest(&boot, launcher.as_ref()) {
         crate::xlog_error!("Shader preparation: {e}");
         eprintln!("xcl: {e}");
         return 2;
+    }
+    if let Some(launcher) = launcher {
+        let _ = watch_launcher(launcher, || {
+            let (shown, presented) = crate::hle::d3d12x::present::counters();
+            crate::xlog_warn!("the launcher (xcl run) is gone – ending the title ({shown} frames shown, {presented} PresentX calls)");
+            crate::report::write_final(None);
+            crate::log::flush();
+            crate::hle::d3d12x::real::end_title(LAUNCHER_GONE);
+        });
     }
     let _ = std::thread::Builder::new().name("xcl-split-counts".into()).spawn(|| loop {
         std::thread::sleep(std::time::Duration::from_secs(10));
@@ -179,5 +215,26 @@ mod tests {
     fn the_system_commit_is_known_and_under_its_limit() {
         let (commit, limit) = system_commit();
         assert!(commit > 0 && commit <= limit, "{commit} of {limit}");
+    }
+
+    /// The watch acts once the launcher's handle is signalled (an event stands for the process
+    /// here: both are waited on the same way), and not before.
+    #[test]
+    fn the_title_ends_when_the_launcher_is_gone() {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        assert!(!event.is_null());
+        let event = unsafe { OwnedHandle::from_raw_handle(event) };
+        let raw = event.as_raw_handle() as usize;
+        let launcher = event.try_clone().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watch = watch_launcher(launcher, move || tx.send(()).unwrap()).unwrap();
+        let early = rx.recv_timeout(std::time::Duration::from_millis(300)).is_ok();
+        unsafe { SetEvent(raw as _) };
+        let ended = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        assert!(!early, "the title ended while the launcher was there");
+        assert!(ended, "the launcher is gone and the title goes on");
+        watch.join().unwrap();
     }
 }
