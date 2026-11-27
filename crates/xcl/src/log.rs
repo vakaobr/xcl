@@ -4,7 +4,8 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -85,7 +86,42 @@ pub fn write(level: Level, args: std::fmt::Arguments<'_>) {
         }
     }
     if ECHO.load(Ordering::Relaxed) && level <= Level::Info {
-        let _ = std::io::stderr().write_all(format!("xcl: {args}\n").as_bytes());
+        echo(format!("xcl: {args}\n"));
+    }
+}
+
+/// Echo lines waiting for the stderr thread, and lines dropped since the last one it wrote.
+static ECHO_PENDING: AtomicUsize = AtomicUsize::new(0);
+static ECHO_DROPPED: AtomicUsize = AtomicUsize::new(0);
+const ECHO_QUEUE: usize = 4096;
+
+/// The echo goes through a thread of its own: a write to a stderr nobody reads (a pipe whose
+/// reader stopped, a console in selection mode) blocks, and it must not block the thread that
+/// logs, which may be the title's inside a console call. With the queue full, lines are dropped
+/// and counted; the file has them all.
+fn echo(line: String) {
+    static TX: OnceLock<Option<SyncSender<String>>> = OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = sync_channel::<String>(ECHO_QUEUE);
+        let spawned = std::thread::Builder::new().name("xcl-stderr".into()).spawn(move || {
+            for line in rx {
+                let dropped = ECHO_DROPPED.swap(0, Ordering::Relaxed);
+                let mut err = std::io::stderr().lock();
+                if dropped > 0 {
+                    let _ = writeln!(err, "xcl: ({dropped} log lines not echoed here: stderr was not being read; the log file has them)");
+                }
+                let _ = err.write_all(line.as_bytes());
+                drop(err);
+                ECHO_PENDING.fetch_sub(1, Ordering::Relaxed);
+            }
+        });
+        spawned.is_ok().then_some(tx)
+    });
+    let Some(tx) = tx else { return };
+    ECHO_PENDING.fetch_add(1, Ordering::Relaxed);
+    if tx.try_send(line).is_err() {
+        ECHO_PENDING.fetch_sub(1, Ordering::Relaxed);
+        ECHO_DROPPED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -94,6 +130,11 @@ pub fn flush() {
         if let Some(f) = g.as_mut() {
             let _ = f.flush();
         }
+    }
+    // the echo gets a moment to catch up (the process may be about to end), never more
+    let until = Instant::now() + std::time::Duration::from_millis(200);
+    while ECHO_PENDING.load(Ordering::Relaxed) > 0 && Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 
@@ -132,5 +173,30 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(died.is_err());
         assert!(log.contains("thread 'xcl-dies' panicked at ") && log.contains("gone for the run"), "the log: {log:?}");
+    }
+
+    /// A stderr nobody reads (a pipe whose reader stopped, a console in selection mode) must not
+    /// stop the thread that logs: the echo is put off or dropped, the file line is written.
+    #[test]
+    fn an_unread_stderr_does_not_stop_the_thread_that_logs() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE};
+        let (reader, writer) = std::io::pipe().unwrap();
+        let old = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+        unsafe { SetStdHandle(STD_ERROR_HANDLE, writer.as_raw_handle()) };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // far more than a pipe holds
+            for i in 0..4000 {
+                write(Level::Info, format_args!("echo into a stderr nobody reads, line {i:4} ........................................"));
+            }
+            let _ = tx.send(());
+        });
+        let done = rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        unsafe { SetStdHandle(STD_ERROR_HANDLE, old) };
+        // a write still blocked on the pipe fails now (no reader) and goes on
+        drop(reader);
+        std::mem::forget(writer);
+        assert!(done, "logging stopped on a stderr nobody reads");
     }
 }
