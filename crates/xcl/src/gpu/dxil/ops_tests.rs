@@ -941,6 +941,28 @@ fn double_unary_legality_matches_dxil_tables() {
     assert_eq!(legal, DOUBLE_UNARY);
 }
 
+/// `umul_wide` on a Mac: the full product in 32-bit operations, with no `UMul` (opcode 42) for
+/// Apple's metal-shaderconverter to stop on and no `Int64Ops`.
+#[test]
+fn umul_wide_without_umul_matches_cpu() {
+    let mut k = kernel();
+    let a = k.input(0);
+    let b = k.input(1);
+    let (hi, lo) = k.s.umul_wide_halves(a, b);
+    k.out(0, hi);
+    k.out(1, lo);
+    let c = k.finish([32, 1, 1]);
+    let dis = validate::disassemble(&c).unwrap();
+    assert!(!dis.contains("binaryWithTwoOuts"), "UMul left in the kernel:\n{dis}");
+    assert!(!dis.contains("64-bit integers"), "the product needs Int64Ops:\n{dis}");
+    let bs = uvals2();
+    let Some(r) = gpu(&c, &mem_of(&[UVALS.to_vec(), bs.clone()]), &[], &[]) else { return };
+    for l in 0..32 {
+        let p = UVALS[l] as u64 * bs[l] as u64;
+        assert_eq!([outv(&r, 0)[l], outv(&r, 1)[l]], [(p >> 32) as u32, p as u32], "lane {l}: {:#x} * {:#x}", UVALS[l], bs[l]);
+    }
+}
+
 #[test]
 fn int64_bit_ops_match_cpu() {
     let mut k = kernel();

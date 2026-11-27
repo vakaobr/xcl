@@ -598,7 +598,11 @@ fn window_at_lowers_to_32bit_carry_without_int64() {
         assert!(!dis.contains("64-bit integers") && !body.contains("i64"), "window_at with adds must not emit i64:\n{dis}");
         assert!(!dis.contains("binaryWithCarryOrBorrow"), "window_at should avoid uaddc struct overhead:\n{dis}");
         assert!(body.contains("icmp ult i32"), "expected scalar 32-bit carry compare in DXIL:\n{dis}");
-        assert!(dis.contains("dx.op.binaryWithTwoOuts.i32"), "expected UMul in DXIL:\n{dis}");
+        if crate::util::mac_host() {
+            assert!(!dis.contains("dx.op.binaryWithTwoOuts"), "UMul on a Mac (metal-shaderconverter stops on it):\n{dis}");
+        } else {
+            assert!(dis.contains("dx.op.binaryWithTwoOuts.i32"), "expected UMul in DXIL:\n{dis}");
+        }
     }
 
     let zero_off = prog(&[

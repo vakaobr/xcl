@@ -426,9 +426,33 @@ impl Shader {
     pub fn imul_wide(&mut self, a: Value, b: Value) -> (Value, Value) {
         self.two_outs(41, a, b)
     }
-    /// Full 64-bit product of two unsigned i32 → `(hi, lo)`.
+    /// Full 64-bit product of two unsigned i32 → `(hi, lo)`. On a Mac, `umul_wide_halves`: Apple's
+    /// metal-shaderconverter under D3DMetal (CrossOver 26.3) stops on some programs with `UMul`
+    /// ("patchBinaryWith2Outs: need to add support for opcode: 42") and the pipeline is refused.
     pub fn umul_wide(&mut self, a: Value, b: Value) -> (Value, Value) {
+        if crate::util::mac_host() {
+            return self.umul_wide_halves(a, b);
+        }
         self.two_outs(42, a, b)
+    }
+    /// `umul_wide` in 32-bit operations, without `UMul` or `Int64Ops`: the high half from the
+    /// 16-bit parts, as `mul_hi_u32` of the HLSL kernel (`recomp::emit`).
+    pub fn umul_wide_halves(&mut self, a: Value, b: Value) -> (Value, Value) {
+        let (m16, s16) = (self.m.i32c(0xFFFF), self.m.i32c(16));
+        let lo = self.m.bin(BinOp::Mul, a, b);
+        let (al, ah) = (self.m.bin(BinOp::And, a, m16), self.m.bin(BinOp::LShr, a, s16));
+        let (bl, bh) = (self.m.bin(BinOp::And, b, m16), self.m.bin(BinOp::LShr, b, s16));
+        let (ll, lh, hl, hh) = (self.m.bin(BinOp::Mul, al, bl), self.m.bin(BinOp::Mul, al, bh), self.m.bin(BinOp::Mul, ah, bl), self.m.bin(BinOp::Mul, ah, bh));
+        let mut mid = self.m.bin(BinOp::LShr, ll, s16);
+        let mut hi = hh;
+        for p in [lh, hl] {
+            let low = self.m.bin(BinOp::And, p, m16);
+            mid = self.m.bin(BinOp::Add, mid, low);
+            let high = self.m.bin(BinOp::LShr, p, s16);
+            hi = self.m.bin(BinOp::Add, hi, high);
+        }
+        let carry = self.m.bin(BinOp::LShr, mid, s16);
+        (self.m.bin(BinOp::Add, hi, carry), lo)
     }
     /// Unsigned divide → `(quotient, remainder)` (division by zero gives all ones).
     pub fn udiv_rem(&mut self, a: Value, b: Value) -> (Value, Value) {
